@@ -27,6 +27,7 @@ Contains all API endpoints:
 """
 
 import json
+import functools
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, Security
@@ -49,6 +50,7 @@ from kiro.cache import ModelInfoCache
 from kiro.model_resolver import ModelResolver
 from kiro.converters_openai import build_kiro_payload
 from kiro.streaming_openai import stream_kiro_to_openai, collect_stream_response, stream_with_first_token_retry
+from kiro.streaming_core import collect_nonstreaming_with_retry
 from kiro.http_client import KiroHttpClient
 from kiro.utils import generate_conversation_id
 from kiro.config import WEB_SEARCH_ENABLED
@@ -421,15 +423,25 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                         return StreamingResponse(stream_wrapper(), media_type="text/event-stream")
                     
                     else:
-                        # Non-streaming mode
-                        openai_response = await collect_stream_response(
-                            http_client.client,
-                            response,
-                            request_data.model,
-                            model_cache,
-                            auth_manager,
-                            request_messages=messages_for_tokenizer,
-                            request_tools=tools_for_tokenizer
+                        # Non-streaming mode. A mid-response disconnect
+                        # (UpstreamStreamError) is safe to retry here because no bytes
+                        # have reached the client yet - the JSONResponse below is only
+                        # built after the upstream stream is fully collected.
+                        openai_response = await collect_nonstreaming_with_retry(
+                            initial_response=response,
+                            make_request=functools.partial(
+                                http_client.request_with_retry,
+                                "POST", url, kiro_payload, stream=True
+                            ),
+                            collect=lambda _resp: collect_stream_response(
+                                http_client.client,
+                                _resp,
+                                request_data.model,
+                                model_cache,
+                                auth_manager,
+                                request_messages=messages_for_tokenizer,
+                                request_tools=tools_for_tokenizer
+                            ),
                         )
                         
                         await http_client.close()
@@ -723,15 +735,24 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
         
         else:
             
-            # Non-streaming mode - collect entire response
-            openai_response = await collect_stream_response(
-                http_client.client,
-                response,
-                request_data.model,
-                model_cache,
-                auth_manager,
-                request_messages=messages_for_tokenizer,
-                request_tools=tools_for_tokenizer
+            # Non-streaming mode - collect entire response. A mid-response disconnect
+            # (UpstreamStreamError) is safe to retry here because no bytes have reached
+            # the client yet - the JSONResponse below is only built after full collection.
+            openai_response = await collect_nonstreaming_with_retry(
+                initial_response=response,
+                make_request=functools.partial(
+                    http_client.request_with_retry,
+                    "POST", url, kiro_payload, stream=True
+                ),
+                collect=lambda _resp: collect_stream_response(
+                    http_client.client,
+                    _resp,
+                    request_data.model,
+                    model_cache,
+                    auth_manager,
+                    request_messages=messages_for_tokenizer,
+                    request_tools=tools_for_tokenizer
+                ),
             )
             
             await http_client.close()

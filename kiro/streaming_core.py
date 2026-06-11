@@ -42,6 +42,7 @@ from kiro.network_errors import classify_network_error
 from kiro.config import (
     FIRST_TOKEN_TIMEOUT,
     FIRST_TOKEN_MAX_RETRIES,
+    NONSTREAM_INTERRUPT_MAX_ATTEMPTS,
     FAKE_REASONING_ENABLED,
     FAKE_REASONING_HANDLING,
 )
@@ -138,6 +139,89 @@ class UpstreamStreamError(Exception):
         """
         super().__init__(message)
         self.is_retryable = is_retryable
+
+
+# ==================================================================================================
+# Non-streaming recovery
+# ==================================================================================================
+
+async def collect_nonstreaming_with_retry(
+    initial_response: httpx.Response,
+    make_request: Callable[[], Awaitable[httpx.Response]],
+    collect: Callable[[httpx.Response], Awaitable[Any]],
+    max_attempts: int = NONSTREAM_INTERRUPT_MAX_ATTEMPTS,
+) -> Any:
+    """
+    Collect a full non-streaming response, retrying the whole upstream request if the
+    upstream interrupts the stream mid-response.
+
+    Non-streaming responses are buffered and only serialized to the client after the
+    upstream stream has been fully collected. A mid-response disconnect (surfaced as a
+    retryable UpstreamStreamError by parse_kiro_stream) therefore leaves the client
+    untouched, which makes it safe to re-issue the request from scratch and collect
+    again. This recovery is NON-STREAMING ONLY: streaming responses forward bytes to
+    the client as they arrive and cannot be transparently retried mid-flight, so the
+    streaming code paths deliberately do not use this helper.
+
+    The first attempt reuses ``initial_response`` (already obtained and status-checked
+    by the caller). Each subsequent attempt calls ``make_request`` to issue a fresh
+    upstream request. If a re-issued request does not return HTTP 200, the original
+    interruption is surfaced so the caller's existing error handling renders a readable
+    response rather than masking it with the retry's status body.
+
+    Args:
+        initial_response: The already-obtained HTTP 200 response used for attempt 1.
+        make_request: Coroutine factory that issues a fresh upstream request (typically
+            ``KiroHttpClient.request_with_retry`` with ``stream=True``). Only invoked for
+            retry attempts.
+        collect: Coroutine that consumes a response stream and returns the aggregated
+            client payload (e.g. ``collect_anthropic_response`` / ``collect_stream_response``).
+        max_attempts: Maximum total attempts including the first (>= 1). When 1, no retry
+            is performed and any UpstreamStreamError propagates immediately.
+
+    Returns:
+        The aggregated payload returned by ``collect``.
+
+    Raises:
+        UpstreamStreamError: If every attempt is interrupted mid-response, the error is
+            not retryable, or a re-issued request does not return HTTP 200.
+        Exception: Any other error raised by ``collect`` or ``make_request`` propagates
+            unchanged, so genuine (non-transport) failures are never masked.
+    """
+    response = initial_response
+    for attempt in range(1, max(1, max_attempts) + 1):
+        try:
+            return await collect(response)
+        except UpstreamStreamError as error:
+            if not error.is_retryable or attempt >= max_attempts:
+                raise
+            logger.warning(
+                f"Upstream stream interrupted during non-streaming collection "
+                f"(attempt {attempt}/{max_attempts}); re-issuing request: {error}"
+            )
+            # Best-effort cleanup of the broken response before re-issuing. Closing
+            # must never mask the interruption we are recovering from.
+            try:
+                await response.aclose()
+            except Exception as close_error:
+                logger.debug(f"Error closing interrupted response: {close_error}")
+
+            response = await make_request()
+            if response.status_code != 200:
+                # The retry attempt failed at the request level. Surface the original
+                # interruption (readable via UpstreamStreamError) instead of the retry's
+                # status body, and release the freshly opened response.
+                try:
+                    await response.aclose()
+                except Exception as close_error:
+                    logger.debug(f"Error closing non-200 retry response: {close_error}")
+                raise
+
+    # Defensive: the loop always returns a payload or raises on its final attempt.
+    raise UpstreamStreamError(
+        "Upstream stream collection failed after all retry attempts.",
+        is_retryable=False,
+    )
 
 
 # ==================================================================================================

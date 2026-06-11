@@ -26,6 +26,7 @@ Reference: https://docs.anthropic.com/en/api/messages
 """
 
 import json
+import functools
 from typing import Optional
 
 import httpx
@@ -50,6 +51,7 @@ from kiro.streaming_anthropic import (
     collect_anthropic_response,
     stream_with_first_token_retry_anthropic,
 )
+from kiro.streaming_core import collect_nonstreaming_with_retry
 from kiro.http_client import KiroHttpClient
 from kiro.utils import generate_conversation_id
 from kiro.tokenizer import estimate_request_tokens
@@ -496,15 +498,25 @@ async def messages(
                         )
                     
                     else:
-                        # Non-streaming mode
-                        anthropic_response = await collect_anthropic_response(
-                            response,
-                            request_data.model,
-                            model_cache,
-                            auth_manager,
-                            request_messages=messages_for_tokenizer,
-                            request_tools=tools_for_tokenizer,
-                            request_system=system_for_tokenizer,
+                        # Non-streaming mode. A mid-response disconnect
+                        # (UpstreamStreamError) is safe to retry here because no bytes
+                        # have reached the client yet - the JSONResponse below is only
+                        # built after the upstream stream is fully collected.
+                        anthropic_response = await collect_nonstreaming_with_retry(
+                            initial_response=response,
+                            make_request=functools.partial(
+                                http_client.request_with_retry,
+                                "POST", url, kiro_payload, stream=True
+                            ),
+                            collect=lambda _resp: collect_anthropic_response(
+                                _resp,
+                                request_data.model,
+                                model_cache,
+                                auth_manager,
+                                request_messages=messages_for_tokenizer,
+                                request_tools=tools_for_tokenizer,
+                                request_system=system_for_tokenizer,
+                            ),
                         )
                         
                         await http_client.close()
@@ -855,15 +867,24 @@ async def messages(
             )
         
         else:
-            # Non-streaming mode - collect entire response
-            anthropic_response = await collect_anthropic_response(
-                response,
-                request_data.model,
-                model_cache,
-                auth_manager,
-                request_messages=messages_for_tokenizer,
-                request_tools=tools_for_tokenizer,
-                request_system=system_for_tokenizer,
+            # Non-streaming mode - collect entire response. A mid-response disconnect
+            # (UpstreamStreamError) is safe to retry here because no bytes have reached
+            # the client yet - the JSONResponse below is only built after full collection.
+            anthropic_response = await collect_nonstreaming_with_retry(
+                initial_response=response,
+                make_request=functools.partial(
+                    http_client.request_with_retry,
+                    "POST", url, kiro_payload, stream=True
+                ),
+                collect=lambda _resp: collect_anthropic_response(
+                    _resp,
+                    request_data.model,
+                    model_cache,
+                    auth_manager,
+                    request_messages=messages_for_tokenizer,
+                    request_tools=tools_for_tokenizer,
+                    request_system=system_for_tokenizer,
+                ),
             )
             
             await http_client.close()

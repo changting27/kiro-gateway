@@ -26,6 +26,7 @@ from kiro.streaming_core import (
     UpstreamStreamError,
     parse_kiro_stream,
     collect_stream_to_result,
+    collect_nonstreaming_with_retry,
     calculate_tokens_from_context_usage,
     stream_with_first_token_retry,
     _process_chunk,
@@ -2009,3 +2010,192 @@ class TestParseKiroStreamUpstreamError:
             with pytest.raises(FirstTokenTimeoutError):
                 async for _ in parse_kiro_stream(mock_response, first_token_timeout=30):
                     pass
+
+
+# ==================================================================================================
+# Tests for collect_nonstreaming_with_retry()
+# ==================================================================================================
+
+class _FakeResponse:
+    """Minimal httpx.Response stand-in that tracks aclose() calls."""
+
+    def __init__(self, status_code: int = 200) -> None:
+        self.status_code = status_code
+        self.closed = False
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class TestCollectNonstreamingWithRetry:
+    """
+    Tests for collect_nonstreaming_with_retry - the non-streaming recovery path that
+    re-issues the upstream request when the stream is interrupted before any bytes
+    reach the client (optimization 2).
+    """
+
+    @pytest.mark.asyncio
+    async def test_returns_payload_without_retry_on_success(self):
+        """
+        What it does: Returns the collected payload on the first successful attempt.
+        Purpose: The happy path must not re-issue the request or touch make_request.
+        """
+        print("Setup: collect succeeds immediately...")
+        initial = _FakeResponse(200)
+        make_calls = {"n": 0}
+
+        async def make_request():
+            make_calls["n"] += 1
+            return _FakeResponse(200)
+
+        async def collect(resp):
+            assert resp is initial  # first attempt must reuse the initial response
+            return {"ok": True}
+
+        result = await collect_nonstreaming_with_retry(initial, make_request, collect, max_attempts=3)
+
+        assert result == {"ok": True}
+        assert make_calls["n"] == 0
+        assert initial.closed is False
+
+    @pytest.mark.asyncio
+    async def test_retries_once_then_succeeds(self):
+        """
+        What it does: Recovers when the first collection is interrupted and the retry works.
+        Purpose: The core win - a transient mid-response disconnect is healed transparently.
+        """
+        print("Setup: collect fails once (retryable), then succeeds...")
+        initial = _FakeResponse(200)
+        reissued = _FakeResponse(200)
+        collect_calls = {"n": 0}
+        make_calls = {"n": 0}
+
+        async def make_request():
+            make_calls["n"] += 1
+            return reissued
+
+        async def collect(resp):
+            collect_calls["n"] += 1
+            if collect_calls["n"] == 1:
+                assert resp is initial
+                raise UpstreamStreamError("closed mid-response", is_retryable=True)
+            assert resp is reissued  # second attempt uses the re-issued response
+            return {"ok": True}
+
+        result = await collect_nonstreaming_with_retry(initial, make_request, collect, max_attempts=2)
+
+        assert result == {"ok": True}
+        assert collect_calls["n"] == 2
+        assert make_calls["n"] == 1
+        assert initial.closed is True  # broken response is closed before re-issuing
+
+    @pytest.mark.asyncio
+    async def test_raises_after_exhausting_attempts(self):
+        """
+        What it does: Raises UpstreamStreamError when every attempt is interrupted.
+        Purpose: On exhaustion the error must propagate (the route turns it into a
+                 readable 500), and the request is re-issued exactly max_attempts-1 times.
+        """
+        print("Setup: collect always fails with a retryable error...")
+        make_calls = {"n": 0}
+
+        async def make_request():
+            make_calls["n"] += 1
+            return _FakeResponse(200)
+
+        async def collect(resp):
+            raise UpstreamStreamError("still closed", is_retryable=True)
+
+        with pytest.raises(UpstreamStreamError, match="still closed"):
+            await collect_nonstreaming_with_retry(_FakeResponse(200), make_request, collect, max_attempts=3)
+
+        # 3 attempts total => 2 re-issues.
+        assert make_calls["n"] == 2
+
+    @pytest.mark.asyncio
+    async def test_non_retryable_error_is_not_retried(self):
+        """
+        What it does: A non-retryable UpstreamStreamError raises immediately.
+        Purpose: Respect the is_retryable flag - never re-issue when recovery is pointless.
+        """
+        print("Setup: collect raises a non-retryable error...")
+        make_calls = {"n": 0}
+
+        async def make_request():
+            make_calls["n"] += 1
+            return _FakeResponse(200)
+
+        async def collect(resp):
+            raise UpstreamStreamError("fatal", is_retryable=False)
+
+        with pytest.raises(UpstreamStreamError, match="fatal"):
+            await collect_nonstreaming_with_retry(_FakeResponse(200), make_request, collect, max_attempts=3)
+
+        assert make_calls["n"] == 0
+
+    @pytest.mark.asyncio
+    async def test_reissued_non_200_surfaces_interruption_and_closes_response(self):
+        """
+        What it does: When the re-issued request returns non-200, the original
+                      interruption is surfaced and the fresh response is closed.
+        Purpose: Avoid masking the disconnect with the retry's status body and avoid
+                 leaking the freshly opened connection.
+        """
+        print("Setup: collect fails retryable, re-issue returns 503...")
+        bad = _FakeResponse(503)
+        collect_calls = {"n": 0}
+
+        async def make_request():
+            return bad
+
+        async def collect(resp):
+            collect_calls["n"] += 1
+            raise UpstreamStreamError("closed", is_retryable=True)
+
+        with pytest.raises(UpstreamStreamError, match="closed"):
+            await collect_nonstreaming_with_retry(_FakeResponse(200), make_request, collect, max_attempts=2)
+
+        assert collect_calls["n"] == 1  # never collected the non-200 response
+        assert bad.closed is True
+
+    @pytest.mark.asyncio
+    async def test_max_attempts_one_disables_retry(self):
+        """
+        What it does: max_attempts=1 performs no retry even for a retryable error.
+        Purpose: Operators can switch the recovery off via configuration.
+        """
+        print("Setup: retryable failure but max_attempts=1...")
+        make_calls = {"n": 0}
+
+        async def make_request():
+            make_calls["n"] += 1
+            return _FakeResponse(200)
+
+        async def collect(resp):
+            raise UpstreamStreamError("closed", is_retryable=True)
+
+        with pytest.raises(UpstreamStreamError):
+            await collect_nonstreaming_with_retry(_FakeResponse(200), make_request, collect, max_attempts=1)
+
+        assert make_calls["n"] == 0
+
+    @pytest.mark.asyncio
+    async def test_non_upstream_exception_propagates_unchanged(self):
+        """
+        What it does: A non-UpstreamStreamError from collect propagates without retry.
+        Purpose: Genuine bugs (e.g. ValueError) must not be retried or relabeled.
+        """
+        print("Setup: collect raises ValueError...")
+        make_calls = {"n": 0}
+
+        async def make_request():
+            make_calls["n"] += 1
+            return _FakeResponse(200)
+
+        async def collect(resp):
+            raise ValueError("genuine bug")
+
+        with pytest.raises(ValueError, match="genuine bug"):
+            await collect_nonstreaming_with_retry(_FakeResponse(200), make_request, collect, max_attempts=3)
+
+        assert make_calls["n"] == 0

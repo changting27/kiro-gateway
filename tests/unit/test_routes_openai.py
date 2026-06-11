@@ -1998,3 +1998,141 @@ class TestChatCompletionsLegacyMode:
         
         assert failover_enabled is False
         print("✅ Legacy mode correctly skips failover loop")
+
+
+class TestOpenAINonStreamingInterruptionRecovery:
+    """
+    Tests that the OpenAI non-streaming path transparently recovers when the upstream
+    closes the connection mid-response (optimization 2), and that the streaming path
+    deliberately does NOT use the non-streaming retry helper.
+    """
+
+    @patch('kiro.routes_openai.collect_stream_response', new_callable=AsyncMock)
+    @patch('kiro.routes_openai.KiroHttpClient')
+    def test_non_streaming_recovers_after_one_interruption(
+        self, mock_client_class, mock_collect, test_client, valid_proxy_api_key
+    ):
+        """
+        What it does: A non-streaming request succeeds after one mid-response disconnect.
+        Purpose: Prove the retry helper is wired into the OpenAI non-streaming path and
+                 heals a transient UpstreamStreamError before any bytes reach the client.
+        """
+        from kiro.streaming_core import UpstreamStreamError
+
+        upstream_response = AsyncMock()
+        upstream_response.status_code = 200
+        mock_client = AsyncMock()
+        mock_client.request_with_retry = AsyncMock(return_value=upstream_response)
+        mock_client.close = AsyncMock()
+        mock_client_class.return_value = mock_client
+
+        valid_payload = {
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "claude-sonnet-4-5",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "hi"},
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+        # First collection is interrupted mid-stream; the retry succeeds.
+        mock_collect.side_effect = [
+            UpstreamStreamError("closed mid-response", is_retryable=True),
+            valid_payload,
+        ]
+
+        print("Action: POST /v1/chat/completions with stream=false...")
+        response = test_client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+            json={
+                "model": "claude-sonnet-4-5",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "stream": False,
+            },
+        )
+
+        print(f"Status: {response.status_code}, collect calls: {mock_collect.await_count}")
+        assert response.status_code == 200, response.text
+        assert response.json()["choices"][0]["message"]["content"] == "hi"
+        assert mock_collect.await_count == 2  # interrupted once, then succeeded
+        assert mock_client.request_with_retry.await_count >= 2  # initial + re-issue
+
+    @patch('kiro.routes_openai.collect_stream_response', new_callable=AsyncMock)
+    @patch('kiro.routes_openai.KiroHttpClient')
+    def test_non_streaming_surfaces_error_after_exhausting_retries(
+        self, mock_client_class, mock_collect, test_client, valid_proxy_api_key
+    ):
+        """
+        What it does: Persistent interruptions yield a non-2xx response, not a hang.
+        Purpose: When every attempt is interrupted, the readable UpstreamStreamError
+                 must propagate to the client error path (optimization 1 message).
+        """
+        from kiro.streaming_core import UpstreamStreamError
+
+        upstream_response = AsyncMock()
+        upstream_response.status_code = 200
+        mock_client = AsyncMock()
+        mock_client.request_with_retry = AsyncMock(return_value=upstream_response)
+        mock_client.close = AsyncMock()
+        mock_client_class.return_value = mock_client
+
+        mock_collect.side_effect = UpstreamStreamError(
+            "The server closed the connection before the response was complete.",
+            is_retryable=True,
+        )
+
+        print("Action: POST /v1/chat/completions with stream=false (persistent failure)...")
+        response = test_client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+            json={
+                "model": "claude-sonnet-4-5",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "stream": False,
+            },
+        )
+
+        print(f"Status: {response.status_code}, collect calls: {mock_collect.await_count}")
+        assert response.status_code >= 400  # surfaced as an error, not a silent hang
+        assert mock_collect.await_count >= 2  # retried before giving up
+
+    @patch('kiro.routes_openai.collect_nonstreaming_with_retry', new_callable=AsyncMock)
+    @patch('kiro.routes_openai.KiroHttpClient')
+    def test_streaming_does_not_use_nonstreaming_retry(
+        self, mock_client_class, mock_retry, test_client, valid_proxy_api_key
+    ):
+        """
+        What it does: A streaming request never calls the non-streaming retry helper.
+        Purpose: Streaming bytes are already in flight and must not be retried - guards
+                 the documented exclusion (AGENTS.md section 10).
+        """
+        upstream_response = AsyncMock()
+        upstream_response.status_code = 200
+        mock_client = AsyncMock()
+        mock_client.request_with_retry = AsyncMock(return_value=upstream_response)
+        mock_client.close = AsyncMock()
+        mock_client_class.return_value = mock_client
+
+        async def fake_stream(*args, **kwargs):
+            # Minimal stream that completes immediately; the point is only to reach
+            # the streaming branch and confirm the retry helper is never used.
+            yield "data: [DONE]\n\n"
+
+        print("Action: POST /v1/chat/completions with stream=true...")
+        with patch('kiro.routes_openai.stream_with_first_token_retry', fake_stream):
+            response = test_client.post(
+                "/v1/chat/completions",
+                headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+                json={
+                    "model": "claude-sonnet-4-5",
+                    "messages": [{"role": "user", "content": "Hi"}],
+                    "stream": True,
+                },
+            )
+            _ = response.content  # force the streaming generator to run
+
+        assert not mock_retry.called, "streaming must not use the non-streaming retry helper"

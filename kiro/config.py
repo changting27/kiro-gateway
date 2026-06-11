@@ -366,6 +366,15 @@ STREAMING_READ_TIMEOUT: float = float(os.getenv("STREAMING_READ_TIMEOUT", "300")
 # Default: 3 attempts
 FIRST_TOKEN_MAX_RETRIES: int = int(os.getenv("FIRST_TOKEN_MAX_RETRIES", "3"))
 
+# Maximum number of attempts for a NON-STREAMING request when the upstream closes
+# the connection mid-response (httpx.ReadError -> UpstreamStreamError). Non-streaming
+# responses are buffered and only sent to the client after the upstream stream is
+# fully collected, so a mid-response disconnect leaves the client untouched and the
+# request can be safely re-issued from scratch. Streaming requests are NOT retried
+# this way because their bytes are already in flight.
+# Set to 1 to disable this recovery. Default: 2 (one retry after the initial attempt).
+NONSTREAM_INTERRUPT_MAX_ATTEMPTS: int = int(os.getenv("NONSTREAM_INTERRUPT_MAX_ATTEMPTS", "2"))
+
 # ==================================================================================================
 # Debug Settings
 # ==================================================================================================
