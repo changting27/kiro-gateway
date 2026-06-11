@@ -38,6 +38,7 @@ import httpx
 from loguru import logger
 
 from kiro.parsers import AwsEventStreamParser, parse_bracket_tool_calls, deduplicate_tool_calls
+from kiro.network_errors import classify_network_error
 from kiro.config import (
     FIRST_TOKEN_TIMEOUT,
     FIRST_TOKEN_MAX_RETRIES,
@@ -109,6 +110,34 @@ class StreamResult:
 class FirstTokenTimeoutError(Exception):
     """Exception raised when first token timeout occurs."""
     pass
+
+
+class UpstreamStreamError(Exception):
+    """
+    Raised when the upstream Kiro stream fails mid-response.
+
+    Wraps the original transport-level exception (preserved as ``__cause__``) but
+    exposes a readable, client-safe message as its string representation, so that
+    downstream handlers and API clients never receive an empty error message. This
+    is primarily triggered by ``httpx.ReadError`` / ``httpx.RemoteProtocolError``
+    when the upstream closes the connection before the response is complete - the
+    classic empty-``str()`` case that previously surfaced as "(empty message)".
+
+    Attributes:
+        is_retryable: Whether the underlying failure is safe to retry. Non-streaming
+            routes consult this flag to decide whether the request can be re-issued.
+    """
+
+    def __init__(self, message: str, *, is_retryable: bool = True) -> None:
+        """
+        Initialize the error.
+
+        Args:
+            message: Readable, client-safe description of the failure.
+            is_retryable: Whether re-issuing the upstream request may succeed.
+        """
+        super().__init__(message)
+        self.is_retryable = is_retryable
 
 
 # ==================================================================================================
@@ -220,6 +249,21 @@ async def parse_kiro_stream(
     except GeneratorExit:
         logger.debug("Client disconnected (GeneratorExit)")
         raise
+    except httpx.RequestError as e:
+        # Transport-level failure while reading the upstream stream. The most common
+        # case is httpx.ReadError raised when the upstream closes the connection
+        # mid-response, whose str() is empty and previously surfaced to clients and
+        # logs as "(empty message)". Convert it into a typed UpstreamStreamError that
+        # carries a readable, client-safe message; the original exception is kept as
+        # __cause__ so the full chain remains visible via exc_info.
+        error_info = classify_network_error(e)
+        logger.error(
+            f"Upstream stream interrupted: [{type(e).__name__}] {error_info.user_message}",
+            exc_info=True
+        )
+        raise UpstreamStreamError(
+            error_info.user_message, is_retryable=error_info.is_retryable
+        ) from e
     except Exception as e:
         error_type = type(e).__name__
         error_msg = str(e) if str(e) else "(empty message)"

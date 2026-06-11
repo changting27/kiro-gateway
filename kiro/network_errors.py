@@ -49,6 +49,7 @@ class ErrorCategory(str, Enum):
     DNS_RESOLUTION = "dns_resolution"
     CONNECTION_REFUSED = "connection_refused"
     CONNECTION_RESET = "connection_reset"
+    CONNECTION_CLOSED = "connection_closed"
     NETWORK_UNREACHABLE = "network_unreachable"
     TIMEOUT_CONNECT = "timeout_connect"
     TIMEOUT_READ = "timeout_read"
@@ -145,6 +146,28 @@ def classify_network_error(error: Exception) -> NetworkErrorInfo:
             suggested_http_code=502
         )
     
+    # Analyze httpx.RemoteProtocolError / httpx.NetworkError (ReadError, WriteError,
+    # CloseError). These typically mean the upstream closed the connection in the
+    # middle of transferring the response. ConnectError (also an httpx.NetworkError)
+    # is handled earlier and returns before reaching this point.
+    if isinstance(error, (httpx.RemoteProtocolError, httpx.NetworkError)):
+        return NetworkErrorInfo(
+            category=ErrorCategory.CONNECTION_CLOSED,
+            user_message=(
+                "The server closed the connection before the response was complete. "
+                "This is usually a temporary upstream issue - please retry the request."
+            ),
+            troubleshooting_steps=[
+                "Retry the request - mid-response disconnects are usually transient",
+                "If it persists, reduce request size (fewer tools or shorter context)",
+                "Check upstream Kiro/AWS status if failures continue",
+                "Enable DEBUG_MODE=errors to capture the full request for analysis"
+            ],
+            technical_details=technical_details,
+            is_retryable=True,
+            suggested_http_code=502
+        )
+
     # Generic httpx.RequestError (catch-all)
     if isinstance(error, httpx.RequestError):
         return NetworkErrorInfo(

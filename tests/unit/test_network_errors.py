@@ -669,3 +669,144 @@ class TestNetworkErrorInfoDataclass:
         assert error_info.technical_details == "Technical details"
         assert error_info.is_retryable is True
         assert error_info.suggested_http_code == 502
+
+
+class TestClassifyNetworkErrorConnectionClosed:
+    """
+    Tests for mid-response connection-closed classification.
+
+    Covers httpx.ReadError / WriteError / CloseError (httpx.NetworkError) and
+    httpx.RemoteProtocolError, which surface when the upstream drops the connection
+    while transferring the response. These previously fell through to the generic
+    catch-all and (for the empty-message ReadError) produced "(empty message)".
+    """
+
+    def test_read_error_with_empty_message_classified_as_connection_closed(self):
+        """
+        What it does: Classifies an empty-message httpx.ReadError as CONNECTION_CLOSED.
+        Purpose: This is the exact production case - str(ReadError) is empty - and it
+                 must yield a readable, actionable message instead of "(empty message)".
+        """
+        print("Setup: Creating httpx.ReadError with empty message (production case)...")
+        read_error = httpx.ReadError("")
+
+        print("Action: Classifying error...")
+        error_info = classify_network_error(read_error)
+
+        print(f"Category: {error_info.category}, message: {error_info.user_message!r}")
+        assert error_info.category == ErrorCategory.CONNECTION_CLOSED
+        # The whole point of the fix: message must be non-empty and actionable.
+        assert error_info.user_message.strip() != ""
+        assert "closed the connection" in error_info.user_message
+        assert "retry" in error_info.user_message.lower()
+        assert error_info.is_retryable is True
+        assert error_info.suggested_http_code == 502
+        assert error_info.troubleshooting_steps  # non-empty list
+
+    def test_read_error_with_message_classified_as_connection_closed(self):
+        """
+        What it does: Classifies a non-empty httpx.ReadError as CONNECTION_CLOSED.
+        Purpose: Ensure classification is by type, not by message content.
+        """
+        print("Setup: Creating httpx.ReadError with a message...")
+        error_info = classify_network_error(httpx.ReadError("connection broken"))
+
+        print(f"Category: {error_info.category}")
+        assert error_info.category == ErrorCategory.CONNECTION_CLOSED
+
+    def test_remote_protocol_error_classified_as_connection_closed(self):
+        """
+        What it does: Classifies httpx.RemoteProtocolError as CONNECTION_CLOSED.
+        Purpose: "Server disconnected without sending a response" is the same failure class.
+        """
+        print("Setup: Creating httpx.RemoteProtocolError...")
+        error_info = classify_network_error(
+            httpx.RemoteProtocolError("Server disconnected without sending a response")
+        )
+
+        print(f"Category: {error_info.category}")
+        assert error_info.category == ErrorCategory.CONNECTION_CLOSED
+        assert error_info.is_retryable is True
+
+    def test_write_error_classified_as_connection_closed(self):
+        """
+        What it does: Classifies httpx.WriteError (a NetworkError) as CONNECTION_CLOSED.
+        Purpose: All non-connect NetworkError subclasses share the disconnect semantics.
+        """
+        print("Setup: Creating httpx.WriteError...")
+        error_info = classify_network_error(httpx.WriteError(""))
+
+        print(f"Category: {error_info.category}")
+        assert error_info.category == ErrorCategory.CONNECTION_CLOSED
+
+    def test_close_error_classified_as_connection_closed(self):
+        """
+        What it does: Classifies httpx.CloseError (a NetworkError) as CONNECTION_CLOSED.
+        Purpose: Cover the full NetworkError family except ConnectError.
+        """
+        print("Setup: Creating httpx.CloseError...")
+        error_info = classify_network_error(httpx.CloseError(""))
+
+        print(f"Category: {error_info.category}")
+        assert error_info.category == ErrorCategory.CONNECTION_CLOSED
+
+    def test_connect_error_is_not_reclassified_as_connection_closed(self):
+        """
+        What it does: Ensures httpx.ConnectError keeps its connect-phase classification.
+        Purpose: ConnectError is also an httpx.NetworkError; ordering must keep it handled
+                 by the earlier ConnectError branch, NOT swallowed by CONNECTION_CLOSED.
+        """
+        print("Setup: Creating connect-phase errors...")
+        refused = classify_network_error(httpx.ConnectError("Connection refused"))
+        reset = classify_network_error(httpx.ConnectError("Connection reset by peer"))
+
+        print(f"refused={refused.category}, reset={reset.category}")
+        assert refused.category == ErrorCategory.CONNECTION_REFUSED
+        assert reset.category == ErrorCategory.CONNECTION_RESET
+        assert refused.category != ErrorCategory.CONNECTION_CLOSED
+        assert reset.category != ErrorCategory.CONNECTION_CLOSED
+
+    def test_timeouts_are_not_reclassified_as_connection_closed(self):
+        """
+        What it does: Ensures timeout exceptions are not captured by the new branch.
+        Purpose: TimeoutException is handled before the NetworkError branch; a read
+                 timeout must remain TIMEOUT_READ, not CONNECTION_CLOSED.
+        """
+        print("Setup: Creating ReadTimeout and ConnectTimeout...")
+        read_timeout = classify_network_error(httpx.ReadTimeout("timed out"))
+        connect_timeout = classify_network_error(httpx.ConnectTimeout("timed out"))
+
+        print(f"read={read_timeout.category}, connect={connect_timeout.category}")
+        assert read_timeout.category == ErrorCategory.TIMEOUT_READ
+        assert connect_timeout.category == ErrorCategory.TIMEOUT_CONNECT
+
+    def test_connection_closed_formats_for_both_apis_non_empty(self):
+        """
+        What it does: Formats a CONNECTION_CLOSED error for both OpenAI and Anthropic.
+        Purpose: The client-facing payload must carry a non-empty message in both wire
+                 formats (the original bug produced an empty client message).
+        """
+        print("Setup: Classifying an empty ReadError...")
+        error_info = classify_network_error(httpx.ReadError(""))
+
+        print("Action: Formatting for OpenAI and Anthropic...")
+        openai_payload = format_error_for_user(error_info, format_type="openai")
+        anthropic_payload = format_error_for_user(error_info, format_type="anthropic")
+
+        print("Verification: both payloads have a non-empty message...")
+        assert openai_payload["error"]["message"].strip() != ""
+        assert openai_payload["error"]["code"] == "connection_closed"
+        assert anthropic_payload["error"]["message"].strip() != ""
+        assert anthropic_payload["type"] == "error"
+
+    def test_connection_closed_short_message_non_empty(self):
+        """
+        What it does: get_short_error_message returns a non-empty single line.
+        Purpose: Logging path must never emit an empty short message for this category.
+        """
+        print("Setup: Classifying an empty ReadError...")
+        error_info = classify_network_error(httpx.ReadError(""))
+
+        short = get_short_error_message(error_info)
+        print(f"Short message: {short!r}")
+        assert short.strip() != ""

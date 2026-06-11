@@ -15,6 +15,7 @@ Tests for:
 
 import pytest
 import asyncio
+import httpx
 from unittest.mock import AsyncMock, MagicMock, patch
 from dataclasses import asdict
 
@@ -22,6 +23,7 @@ from kiro.streaming_core import (
     KiroEvent,
     StreamResult,
     FirstTokenTimeoutError,
+    UpstreamStreamError,
     parse_kiro_stream,
     collect_stream_to_result,
     calculate_tokens_from_context_usage,
@@ -1832,3 +1834,178 @@ class TestStreamWithFirstTokenRetryCore:
         assert make_request_call_count == 1
         assert len(chunks) == 1
         print("✓ make_request called immediately when initial_response is None")
+
+
+# ==================================================================================================
+# Tests for UpstreamStreamError
+# ==================================================================================================
+
+class TestUpstreamStreamError:
+    """Tests for the UpstreamStreamError exception."""
+
+    def test_creates_with_message_and_default_retryable(self):
+        """
+        What it does: Creates the error with a message and default is_retryable.
+        Purpose: str() must return the message and is_retryable defaults to True.
+        """
+        print("Action: Creating UpstreamStreamError...")
+        error = UpstreamStreamError("The server closed the connection")
+
+        assert str(error) == "The server closed the connection"
+        assert str(error).strip() != ""
+        assert error.is_retryable is True
+
+    def test_can_mark_not_retryable(self):
+        """
+        What it does: Allows is_retryable to be set False.
+        Purpose: Some transport failures are not safe to retry; the flag must be honored.
+        """
+        print("Action: Creating non-retryable UpstreamStreamError...")
+        error = UpstreamStreamError("fatal", is_retryable=False)
+
+        assert error.is_retryable is False
+
+    def test_inherits_from_exception(self):
+        """
+        What it does: Confirms UpstreamStreamError is a normal Exception.
+        Purpose: Broad `except Exception` handlers in routes must still catch it.
+        """
+        assert isinstance(UpstreamStreamError("x"), Exception)
+
+
+# ==================================================================================================
+# Tests for parse_kiro_stream() mid-stream transport-error conversion
+# ==================================================================================================
+
+class TestParseKiroStreamUpstreamError:
+    """
+    Tests that parse_kiro_stream converts transport-level failures into a typed
+    UpstreamStreamError carrying a readable message (the core of optimization 1).
+    """
+
+    @pytest.mark.asyncio
+    async def test_midstream_read_error_becomes_upstream_stream_error(self, mock_response, mock_parser):
+        """
+        What it does: A ReadError raised AFTER the first token is converted to
+                      UpstreamStreamError with a readable, non-empty message.
+        Purpose: Exact production case - upstream drops the connection mid-response and
+                 str(ReadError) is empty. The client/log must never see "(empty message)".
+        """
+        print("Setup: first chunk OK, then empty-message ReadError mid-stream...")
+
+        async def mock_aiter_bytes():
+            yield b'first-chunk'
+            raise httpx.ReadError("")  # empty message, like production
+
+        mock_response.aiter_bytes = mock_aiter_bytes
+
+        print("Action: Parsing stream and expecting UpstreamStreamError...")
+        with patch('kiro.streaming_core.AwsEventStreamParser', return_value=mock_parser):
+            with patch('kiro.streaming_core.FAKE_REASONING_ENABLED', False):
+                with pytest.raises(UpstreamStreamError) as exc_info:
+                    async for _ in parse_kiro_stream(mock_response, first_token_timeout=30):
+                        pass
+
+        err = exc_info.value
+        print(f"Raised: {err!r} (retryable={err.is_retryable}, cause={type(err.__cause__).__name__})")
+        # Readable, non-empty message - the whole point of the fix.
+        assert str(err).strip() != ""
+        assert "(empty message)" not in str(err)
+        assert "closed the connection" in str(err)
+        assert err.is_retryable is True
+        # Original transport error preserved for server-side debugging via exc_info.
+        assert isinstance(err.__cause__, httpx.ReadError)
+
+    @pytest.mark.asyncio
+    async def test_read_error_before_first_token_becomes_upstream_stream_error(self, mock_response, mock_parser):
+        """
+        What it does: A ReadError raised on the very first read is also converted.
+        Purpose: The disconnect can happen before any token arrives; it must not leak
+                 as a raw empty-message ReadError nor be mistaken for a timeout.
+        """
+        print("Setup: ReadError on the first read...")
+
+        async def mock_aiter_bytes():
+            raise httpx.ReadError("")
+            yield  # pragma: no cover - makes this an async generator
+
+        mock_response.aiter_bytes = mock_aiter_bytes
+
+        print("Action: Parsing stream...")
+        with patch('kiro.streaming_core.AwsEventStreamParser', return_value=mock_parser):
+            with patch('kiro.streaming_core.FAKE_REASONING_ENABLED', False):
+                with pytest.raises(UpstreamStreamError) as exc_info:
+                    async for _ in parse_kiro_stream(mock_response, first_token_timeout=30):
+                        pass
+
+        assert str(exc_info.value).strip() != ""
+        assert isinstance(exc_info.value.__cause__, httpx.ReadError)
+
+    @pytest.mark.asyncio
+    async def test_midstream_remote_protocol_error_becomes_upstream_stream_error(self, mock_response, mock_parser):
+        """
+        What it does: A RemoteProtocolError mid-stream is converted to UpstreamStreamError.
+        Purpose: "Server disconnected without sending a response" is the same failure class.
+        """
+        print("Setup: first chunk OK, then RemoteProtocolError...")
+
+        async def mock_aiter_bytes():
+            yield b'first-chunk'
+            raise httpx.RemoteProtocolError("peer closed connection without complete message")
+
+        mock_response.aiter_bytes = mock_aiter_bytes
+
+        print("Action: Parsing stream...")
+        with patch('kiro.streaming_core.AwsEventStreamParser', return_value=mock_parser):
+            with patch('kiro.streaming_core.FAKE_REASONING_ENABLED', False):
+                with pytest.raises(UpstreamStreamError) as exc_info:
+                    async for _ in parse_kiro_stream(mock_response, first_token_timeout=30):
+                        pass
+
+        assert str(exc_info.value).strip() != ""
+        assert isinstance(exc_info.value.__cause__, httpx.RemoteProtocolError)
+
+    @pytest.mark.asyncio
+    async def test_non_transport_exception_is_not_converted(self, mock_response, mock_parser):
+        """
+        What it does: A non-httpx exception (ValueError) is NOT converted.
+        Purpose: Guard against over-catching - genuine bugs must keep their own type so
+                 they are not silently relabeled as connection-closed events.
+        """
+        print("Setup: first chunk OK, then a ValueError (simulated parsing bug)...")
+
+        async def mock_aiter_bytes():
+            yield b'first-chunk'
+            raise ValueError("genuine parsing bug")
+
+        mock_response.aiter_bytes = mock_aiter_bytes
+
+        print("Action: Parsing stream, expecting the original ValueError...")
+        with patch('kiro.streaming_core.AwsEventStreamParser', return_value=mock_parser):
+            with patch('kiro.streaming_core.FAKE_REASONING_ENABLED', False):
+                with pytest.raises(ValueError, match="genuine parsing bug"):
+                    async for _ in parse_kiro_stream(mock_response, first_token_timeout=30):
+                        pass
+
+    @pytest.mark.asyncio
+    async def test_first_token_timeout_still_raised_not_converted(self, mock_response):
+        """
+        What it does: First-token timeout still raises FirstTokenTimeoutError.
+        Purpose: Regression guard - the new httpx.RequestError branch must not interfere
+                 with the first-token retry path (which keys off FirstTokenTimeoutError).
+        """
+        print("Setup: Mock response that times out on first token...")
+
+        async def mock_aiter_bytes():
+            yield b'never reached'
+
+        mock_response.aiter_bytes = mock_aiter_bytes
+
+        async def mock_wait_for_timeout(*args, **kwargs):
+            raise asyncio.TimeoutError()
+
+        print("Action: Parsing stream with a timeout...")
+        with patch('kiro.streaming_core.asyncio.wait_for', side_effect=mock_wait_for_timeout):
+            with pytest.raises(FirstTokenTimeoutError):
+                async for _ in parse_kiro_stream(mock_response, first_token_timeout=30):
+                    pass
