@@ -47,7 +47,7 @@ from kiro.streaming_core import (
     calculate_tokens_from_context_usage,
     stream_with_first_token_retry,
 )
-from kiro.tokenizer import count_tokens, estimate_request_tokens
+from kiro.tokenizer import count_tokens, estimate_request_tokens, serialize_tool_calls_for_tokens
 from kiro.observability import add_token_usage
 from kiro.parsers import parse_bracket_tool_calls, deduplicate_tool_calls
 from kiro.config import FIRST_TOKEN_TIMEOUT, FIRST_TOKEN_MAX_RETRIES, FAKE_REASONING_HANDLING
@@ -622,8 +622,11 @@ async def stream_kiro_to_anthropic(
                 f"{'Model will be notified automatically about truncation.' if TRUNCATION_RECOVERY else 'Set TRUNCATION_RECOVERY=true in .env to auto-notify model about truncation.'}"
             )
         
-        # Calculate output tokens
-        output_tokens = count_tokens(full_content + full_thinking_content)
+        # Calculate output tokens (include tool-call name+arguments so tool-heavy
+        # responses are not undercounted).
+        output_tokens = count_tokens(
+            full_content + full_thinking_content + serialize_tool_calls_for_tokens(tool_blocks)
+        )
         
         # Calculate total tokens from context usage if available
         if context_usage_percentage is not None:
@@ -806,8 +809,11 @@ async def collect_anthropic_response(
             "input": tool_input
         })
     
-    # Calculate output tokens
-    output_tokens = count_tokens(result.content + result.thinking_content)
+    # Calculate output tokens (include tool-call name+arguments so tool-heavy
+    # responses are not undercounted).
+    output_tokens = count_tokens(
+        result.content + result.thinking_content + serialize_tool_calls_for_tokens(result.tool_calls)
+    )
     
     # Calculate from context usage if available
     if result.context_usage_percentage is not None:

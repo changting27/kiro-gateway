@@ -43,7 +43,7 @@ from kiro.config import (
     FIRST_TOKEN_MAX_RETRIES,
     FAKE_REASONING_HANDLING,
 )
-from kiro.tokenizer import count_tokens, count_message_tokens, count_tools_tokens
+from kiro.tokenizer import count_tokens, count_message_tokens, count_tools_tokens, serialize_tool_calls_for_tokens
 from kiro.observability import add_token_usage
 
 # Import from streaming_core - reuse shared parsing logic
@@ -302,8 +302,11 @@ async def stream_kiro_to_openai_internal(
         else:
             finish_reason = "stop"
         
-        # Count completion_tokens (output) using tiktoken
-        completion_tokens = count_tokens(full_content + full_thinking_content)
+        # Count completion_tokens (output) using tiktoken.
+        # Include tool-call name+arguments so tool-heavy responses are not undercounted.
+        completion_tokens = count_tokens(
+            full_content + full_thinking_content + serialize_tool_calls_for_tokens(all_tool_calls)
+        )
         
         # Calculate total_tokens based on context_usage_percentage from Kiro API
         # context_usage shows TOTAL percentage of context usage (input + output)

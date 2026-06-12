@@ -1057,3 +1057,85 @@ class TestTokenizerIntegration:
         assert len(set(results)) == 1, "Results should be consistent"
     
     
+
+
+class TestSerializeToolCallsForTokens:
+    """
+    Tests for serialize_tool_calls_for_tokens - flattening tool calls so their
+    name+arguments are counted in output tokens (fix for undercounting tool-heavy
+    responses, e.g. agentic Claude Code; refs #149).
+    """
+
+    def test_empty_and_none_return_empty(self):
+        """
+        What it does: None/empty tool-call lists serialize to "".
+        Purpose: No tool calls must contribute zero output tokens.
+        """
+        from kiro.tokenizer import serialize_tool_calls_for_tokens
+        assert serialize_tool_calls_for_tokens(None) == ""
+        assert serialize_tool_calls_for_tokens([]) == ""
+
+    def test_openai_shape_includes_name_and_arguments(self):
+        """
+        What it does: OpenAI-shaped tool calls (function.name + arguments JSON
+                      string) are flattened to include name and arguments.
+        Purpose: OpenAI streaming path must count tool output.
+        """
+        from kiro.tokenizer import serialize_tool_calls_for_tokens
+        text = serialize_tool_calls_for_tokens([
+            {"id": "c1", "type": "function",
+             "function": {"name": "get_weather", "arguments": '{"location":"London"}'}},
+        ])
+        assert "get_weather" in text
+        assert "London" in text
+
+    def test_anthropic_shape_includes_name_and_input(self):
+        """
+        What it does: Anthropic-shaped tool calls (name + input object) are flattened.
+        Purpose: Anthropic streaming/non-streaming paths must count tool output.
+        """
+        from kiro.tokenizer import serialize_tool_calls_for_tokens
+        text = serialize_tool_calls_for_tokens([
+            {"type": "tool_use", "id": "t1", "name": "get_weather",
+             "input": {"location": "London", "unit": "celsius"}},
+        ])
+        assert "get_weather" in text
+        assert "London" in text and "celsius" in text
+
+    def test_bare_name_and_arguments_dict(self):
+        """
+        What it does: A bare {name, arguments: dict} tool call is flattened.
+        Purpose: Tolerate the parser's intermediate tool-call shape.
+        """
+        from kiro.tokenizer import serialize_tool_calls_for_tokens
+        text = serialize_tool_calls_for_tokens([{"name": "f", "arguments": {"a": 1}}])
+        assert "f" in text and "a" in text
+
+    def test_non_dict_items_are_ignored(self):
+        """
+        What it does: Non-dict items in the list are skipped without error.
+        Purpose: Robustness against malformed tool-call entries.
+        """
+        from kiro.tokenizer import serialize_tool_calls_for_tokens
+        assert serialize_tool_calls_for_tokens(["x", None, 123]) == ""
+
+    def test_missing_fields_are_graceful(self):
+        """
+        What it does: A tool call missing name/arguments yields no crash.
+        Purpose: Defensive - partial tool calls must not break token counting.
+        """
+        from kiro.tokenizer import serialize_tool_calls_for_tokens
+        assert serialize_tool_calls_for_tokens([{}]) == ""
+        assert serialize_tool_calls_for_tokens([{"name": "only_name"}]) == "only_name"
+
+    def test_tool_calls_increase_output_token_count(self):
+        """
+        What it does: Counting text+tool-calls exceeds counting text alone.
+        Purpose: The core fix - tool-heavy responses are no longer undercounted.
+        """
+        from kiro.tokenizer import serialize_tool_calls_for_tokens, count_tokens
+        tool_calls = [{"type": "tool_use", "name": "get_weather",
+                       "input": {"location": "London", "unit": "celsius"}}]
+        base = count_tokens("hello")
+        with_tools = count_tokens("hello" + serialize_tool_calls_for_tokens(tool_calls))
+        assert with_tools > base

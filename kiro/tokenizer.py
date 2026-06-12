@@ -107,6 +107,52 @@ def count_tokens(text: str, apply_claude_correction: bool = True) -> int:
     return base_estimate
 
 
+def serialize_tool_calls_for_tokens(tool_calls: Optional[List[Any]]) -> str:
+    """
+    Serialize tool calls to text for output-token counting.
+
+    A response that invokes tools spends output tokens on the tool name and
+    arguments, but those live in structured tool_use blocks rather than the text
+    content. This flattens each tool call to ``name + arguments`` text so it can be
+    included in the completion/output token count. Tolerant of both OpenAI-shaped
+    (``function.name`` / ``function.arguments`` JSON string) and Anthropic-shaped
+    (``name`` / ``input`` object) tool calls.
+
+    Args:
+        tool_calls: List of tool-call dicts in either OpenAI or Anthropic shape.
+
+    Returns:
+        Concatenated ``name`` + ``arguments`` text approximating the tool-call
+        output, or an empty string when there are no tool calls.
+    """
+    if not tool_calls:
+        return ""
+
+    parts: List[str] = []
+    for call in tool_calls:
+        if not isinstance(call, dict):
+            continue
+        function = call.get("function") if isinstance(call.get("function"), dict) else {}
+        name = function.get("name") or call.get("name") or ""
+        # Arguments: OpenAI uses function.arguments (JSON string); Anthropic uses input (object).
+        arguments = function.get("arguments")
+        if arguments is None:
+            arguments = call.get("input")
+        if arguments is None:
+            arguments = call.get("arguments")
+        if isinstance(arguments, (dict, list)):
+            arguments_text = json.dumps(arguments, ensure_ascii=False)
+        elif arguments is None:
+            arguments_text = ""
+        else:
+            arguments_text = str(arguments)
+        if name:
+            parts.append(name)
+        if arguments_text:
+            parts.append(arguments_text)
+    return "".join(parts)
+
+
 def count_message_tokens(messages: List[Dict[str, Any]], apply_claude_correction: bool = True) -> int:
     """
     Counts tokens in a list of chat messages.
