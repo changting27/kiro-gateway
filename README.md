@@ -26,6 +26,8 @@ Made with ❤️ by [@Jwadow](https://github.com/jwadow)
 
 > 🔒 **Claude Opus 4.5** was removed from the free tier on January 17, 2026. It may be available on paid tiers — check your IDE/CLI model list.
 
+👑 **Claude Opus 4.8** — Most capable Claude model. Best for complex reasoning, system architecture, and long-horizon agentic work.
+
 🚀 **Claude Sonnet 4.5** — Balanced performance. Great for coding, writing, and general-purpose tasks.
 
 ⚡ **Claude Haiku 4.5** — Lightning fast. Perfect for quick responses, simple tasks, and chat.
@@ -60,7 +62,8 @@ Made with ❤️ by [@Jwadow](https://github.com/jwadow)
 | 🛠️ **Tool Calling** | Supports function calling |
 | 💬 **Full message history** | Passes complete conversation context |
 | 📡 **Streaming** | Full SSE streaming support |
-| 🔄 **Retry Logic** | Automatic retries on errors (403, 429, 5xx) |
+| 🔄 **Retry Logic** | Automatic retries on errors (403, 429, 5xx) and mid-response disconnects |
+| 📊 **Observability** | Per-request metrics, request-id tracing, Prometheus `/metrics` endpoint, optional JSONL logs |
 | 📋 **Extended model list** | Including versioned models |
 | 🔐 **Smart token management** | Automatic refresh before expiration |
 
@@ -759,6 +762,28 @@ When enabled, requests are logged to the `debug_logs/` folder:
 | `response_stream_modified.txt` | Transformed stream (OpenAI format) |
 | `app_logs.txt` | Application logs for the request |
 | `error_info.json` | Error details (only on errors) |
+
+---
+
+## 📊 Observability
+
+The gateway records **per-request metrics** (latency, token usage, status, retries) and tags every request with a unique **request ID** that is propagated through the logs for end-to-end tracing. Enabled by default.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OBSERVABILITY_ENABLED` | `true` | Master switch for per-request metrics collection |
+| `OBSERVABILITY_JSONL_ENABLED` | `true` | Append one JSON record per request to the log directory |
+| `OBSERVABILITY_LOG_DIR` | `observability` | Directory for the JSONL metrics log (gitignored) |
+
+- **`GET /metrics`** — Prometheus exposition (request counts, latency, token usage) for scraping or dashboards.
+- **Request ID** — included in every loguru log line, so a single request can be traced across the whole pipeline.
+- **JSONL sink** — when enabled, each completed request is appended as one JSON record under `OBSERVABILITY_LOG_DIR/`.
+
+To disable it entirely:
+
+```env
+OBSERVABILITY_ENABLED=false
+```
 
 ---
 
