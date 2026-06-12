@@ -5,8 +5,8 @@
 Unit tests for OpenAI API endpoints (routes_openai.py).
 
 Tests the following endpoints:
-- GET / - Root endpoint
-- GET /health - Health check
+- GET / and HEAD / - Root endpoint (liveness/health probe)
+- GET /health and HEAD /health - Health check
 - GET /v1/models - List available models
 - POST /v1/chat/completions - Chat completions
 
@@ -23,7 +23,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from kiro.routes_openai import verify_api_key, router
-from kiro.config import PROXY_API_KEY, APP_VERSION
+from kiro.config import PROXY_API_KEY, APP_VERSION, HEALTH_CHECK_METHODS
 
 
 # =============================================================================
@@ -199,6 +199,59 @@ class TestRootEndpoint:
         print(f"Status: {response.status_code}")
         assert response.status_code == 200
 
+    def test_root_head_request_returns_200(self, test_client):
+        """
+        What it does: Verifies HEAD / returns 200 (not 405).
+        Purpose: Regression guard for the HEAD->405 bug - uptime monitors and
+                 load balancers probe the root with HEAD and must get 200.
+        """
+        print("Action: HEAD /...")
+        response = test_client.head("/")
+
+        print(f"Status: {response.status_code}")
+        assert response.status_code == 200
+
+    def test_root_head_request_has_empty_body(self, test_client):
+        """
+        What it does: Verifies HEAD / returns no response body.
+        Purpose: Ensure correct HTTP HEAD semantics (RFC 7231 sec. 4.3.2) - same
+                 status/headers as GET but an empty body.
+        """
+        print("Action: HEAD /...")
+        response = test_client.head("/")
+
+        print(f"Body length: {len(response.content)}")
+        assert response.status_code == 200
+        assert response.content == b""
+
+    def test_root_head_does_not_require_auth(self, test_client):
+        """
+        What it does: Verifies HEAD / works without authentication.
+        Purpose: Ensure liveness probes never need credentials, matching GET /.
+        """
+        print("Action: HEAD / without auth headers...")
+        response = test_client.head("/")
+
+        print(f"Status: {response.status_code}")
+        assert response.status_code == 200
+
+    def test_root_disallowed_method_returns_405_with_allow_header(self, test_client):
+        """
+        What it does: Verifies a non-GET/HEAD method on / returns 405 and an
+                      Allow header advertising exactly the supported methods.
+        Purpose: Ensure we widened the root to GET+HEAD only - other verbs stay
+                 rejected and the Allow header tells clients what is permitted.
+        """
+        print("Action: POST / (disallowed method)...")
+        response = test_client.post("/")
+
+        print(f"Status: {response.status_code}, Allow: {response.headers.get('allow')}")
+        assert response.status_code == 405
+        allow_header = response.headers.get("allow", "").upper()
+        assert "GET" in allow_header
+        assert "HEAD" in allow_header
+        assert "POST" not in allow_header
+
 
 # =============================================================================
 # Tests for health endpoint (/health)
@@ -256,6 +309,99 @@ class TestHealthEndpoint:
         
         print(f"Status: {response.status_code}")
         assert response.status_code == 200
+
+    def test_health_head_request_returns_200(self, test_client):
+        """
+        What it does: Verifies HEAD /health returns 200 (not 405).
+        Purpose: Regression guard - the detailed health endpoint shares the same
+                 HEAD->405 defect as / and must answer HEAD probes too.
+        """
+        print("Action: HEAD /health...")
+        response = test_client.head("/health")
+
+        print(f"Status: {response.status_code}")
+        assert response.status_code == 200
+
+    def test_health_head_request_has_empty_body(self, test_client):
+        """
+        What it does: Verifies HEAD /health returns no response body.
+        Purpose: Ensure correct HTTP HEAD semantics (empty body, GET-equivalent
+                 status/headers).
+        """
+        print("Action: HEAD /health...")
+        response = test_client.head("/health")
+
+        print(f"Body length: {len(response.content)}")
+        assert response.status_code == 200
+        assert response.content == b""
+
+    def test_health_head_does_not_require_auth(self, test_client):
+        """
+        What it does: Verifies HEAD /health works without authentication.
+        Purpose: Ensure load-balancer health checks never need credentials.
+        """
+        print("Action: HEAD /health without auth headers...")
+        response = test_client.head("/health")
+
+        print(f"Status: {response.status_code}")
+        assert response.status_code == 200
+
+    def test_health_disallowed_method_returns_405_with_allow_header(self, test_client):
+        """
+        What it does: Verifies a non-GET/HEAD method on /health returns 405 with
+                      an Allow header advertising the supported methods.
+        Purpose: Ensure the widening is limited to GET+HEAD and other verbs stay
+                 rejected.
+        """
+        print("Action: DELETE /health (disallowed method)...")
+        response = test_client.delete("/health")
+
+        print(f"Status: {response.status_code}, Allow: {response.headers.get('allow')}")
+        assert response.status_code == 405
+        allow_header = response.headers.get("allow", "").upper()
+        assert "GET" in allow_header
+        assert "HEAD" in allow_header
+        assert "DELETE" not in allow_header
+
+
+# =============================================================================
+# Tests for health-check method configuration (HEALTH_CHECK_METHODS)
+# =============================================================================
+
+class TestHealthCheckMethods:
+    """
+    Tests for the shared HEALTH_CHECK_METHODS constant and its containment.
+
+    These guard the systemic fix: health endpoints (and only health endpoints)
+    accept HEAD in addition to GET. The constant is the single source of truth,
+    and we explicitly assert that an unrelated GET-only endpoint was NOT changed.
+    """
+
+    def test_health_check_methods_constant_is_get_and_head(self):
+        """
+        What it does: Verifies HEALTH_CHECK_METHODS is exactly ["GET", "HEAD"].
+        Purpose: Lock the single source of truth so health endpoints expose the
+                 intended verbs and nothing more (e.g. no accidental POST/DELETE).
+        """
+        print(f"Checking HEALTH_CHECK_METHODS = {HEALTH_CHECK_METHODS}")
+        assert HEALTH_CHECK_METHODS == ["GET", "HEAD"]
+
+    def test_models_endpoint_still_rejects_head(self, test_client):
+        """
+        What it does: Verifies HEAD /v1/models still returns 405 (Method Not
+                      Allowed), i.e. it remains GET-only.
+        Purpose: Scope containment - prove the fix did NOT globally add HEAD to
+                 every GET route, only to the dedicated health-check endpoints.
+                 The 405 is returned at the routing layer before auth runs.
+        """
+        print("Action: HEAD /v1/models (should stay GET-only)...")
+        response = test_client.head("/v1/models")
+
+        print(f"Status: {response.status_code}, Allow: {response.headers.get('allow')}")
+        assert response.status_code == 405
+        allow_header = response.headers.get("allow", "").upper()
+        assert "GET" in allow_header
+        assert "HEAD" not in allow_header
 
 
 # =============================================================================

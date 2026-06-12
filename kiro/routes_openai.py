@@ -39,6 +39,7 @@ from kiro.config import (
     PROXY_API_KEY,
     APP_VERSION,
     PROFILE_ARN,
+    HEALTH_CHECK_METHODS,
 )
 from kiro.models_openai import (
     OpenAIModel,
@@ -93,11 +94,16 @@ async def verify_api_key(auth_header: str = Security(api_key_header)) -> bool:
 router = APIRouter()
 
 
-@router.get("/")
+@router.api_route("/", methods=HEALTH_CHECK_METHODS)
 async def root():
     """
     Health check endpoint.
-    
+
+    Accepts GET and HEAD (see ``HEALTH_CHECK_METHODS``) so that uptime monitors,
+    load balancers, and container health checks can probe with either method.
+    For HEAD requests Starlette returns the same status and headers with an empty
+    body, per HTTP semantics.
+
     Returns:
         Status and application version
     """
@@ -108,11 +114,14 @@ async def root():
     }
 
 
-@router.get("/health")
+@router.api_route("/health", methods=HEALTH_CHECK_METHODS)
 async def health():
     """
     Detailed health check.
-    
+
+    Accepts GET and HEAD (see ``HEALTH_CHECK_METHODS``) for compatibility with
+    monitoring and load-balancer probes that issue HEAD requests.
+
     Returns:
         Status, timestamp and version
     """

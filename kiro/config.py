@@ -587,6 +587,26 @@ APP_TITLE: str = "Kiro Gateway"
 APP_DESCRIPTION: str = "Proxy gateway for Kiro API (Amazon Q Developer / AWS CodeWhisperer). OpenAI and Anthropic compatible. Made by @jwadow"
 
 
+# ==================================================================================================
+# Health-Check HTTP Methods
+# ==================================================================================================
+# Single source of truth for the HTTP methods that liveness / health-check
+# endpoints (e.g. GET / and GET /health) must accept.
+#
+# Why HEAD is required:
+#   FastAPI's APIRoute - unlike Starlette's base Route - does NOT automatically
+#   add HEAD to a GET route. A bare ``@router.get("/")`` therefore answers HEAD
+#   probes with ``405 Method Not Allowed``. Uptime monitors, load balancers, and
+#   container health checks routinely probe with HEAD (RFC 7231 sec. 4.3.2: HEAD is
+#   identical to GET but the response carries no body). Registering both methods
+#   keeps these probes working while preserving correct HEAD semantics (Starlette
+#   strips the response body for HEAD automatically).
+#
+# Defining this once keeps every health-check endpoint consistent and lets new
+# ones opt in without re-deriving the method list.
+HEALTH_CHECK_METHODS: List[str] = ["GET", "HEAD"]
+
+
 def get_kiro_refresh_url(region: str) -> str:
     """Return Kiro Desktop Auth token refresh URL for the specified region."""
     return KIRO_REFRESH_URL_TEMPLATE.format(region=region)
