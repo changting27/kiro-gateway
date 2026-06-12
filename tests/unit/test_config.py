@@ -349,21 +349,29 @@ class TestServerHostConfig:
         What it does: Verifies that SERVER_HOST defaults to 0.0.0.0.
         Purpose: Ensure that 0.0.0.0 (all interfaces) is used when no environment variable is set.
         """
-        print("Setup: Removing SERVER_HOST from environment...")
-        
-        with patch.dict(os.environ, {}, clear=False):
-            if "SERVER_HOST" in os.environ:
-                del os.environ["SERVER_HOST"]
-            
-            import importlib
-            import kiro.config as config_module
+        print("Setup: Removing SERVER_HOST from environment and isolating from .env...")
+
+        import importlib
+        import kiro.config as config_module
+
+        # Isolate from any developer .env: reloading config re-runs load_dotenv(),
+        # which would re-populate SERVER_HOST from a local .env (e.g. a developer
+        # using SERVER_HOST=127.0.0.1) and mask the built-in default. Patch
+        # load_dotenv to a no-op so this test asserts the real default regardless
+        # of the local environment.
+        with patch.dict(os.environ, {}, clear=False), patch("dotenv.load_dotenv"):
+            os.environ.pop("SERVER_HOST", None)
             importlib.reload(config_module)
-            
+
             print(f"SERVER_HOST: {config_module.SERVER_HOST}")
             print(f"DEFAULT_SERVER_HOST: {config_module.DEFAULT_SERVER_HOST}")
             print(f"Comparing: Expected '0.0.0.0', Got '{config_module.SERVER_HOST}'")
             assert config_module.SERVER_HOST == "0.0.0.0"
             assert config_module.DEFAULT_SERVER_HOST == "0.0.0.0"
+
+        # Restore real config state (reload with the actual environment/.env) so
+        # later tests and modules observe the normal configuration.
+        importlib.reload(config_module)
     
     def test_server_host_from_environment(self):
         """
