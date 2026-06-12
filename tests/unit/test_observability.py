@@ -566,3 +566,86 @@ class TestObservabilityMiddleware:
         start = next(m for m in sent if m["type"] == "http.response.start")
         assert dict(start["headers"]).get(b"x-kiro-gateway-request-id") is None
         assert obs.registry.snapshot()["requests_total"] == 0
+
+
+# ==================================================================================================
+# Prometheus exposition + /metrics endpoint
+# ==================================================================================================
+
+class TestPrometheus:
+    """Tests for render_prometheus and the /metrics endpoint."""
+
+    def test_render_contains_core_series_after_recording(self):
+        """
+        What it does: Rendered text reflects recorded requests with HELP/TYPE.
+        Purpose: Counters must surface in valid Prometheus exposition.
+        """
+        obs.registry.record(_make_metrics(
+            api="openai", model="m1", status_code=200, outcome=OUTCOME_COMPLETED,
+            prompt_tokens=100, completion_tokens=20, total_ms=300.0,
+        ))
+        text = obs.render_prometheus()
+
+        assert "# HELP kiro_gateway_requests_total" in text
+        assert "# TYPE kiro_gateway_requests_total counter" in text
+        assert "kiro_gateway_requests_total 1" in text
+        assert 'kiro_gateway_requests_by_api{api="openai"} 1' in text
+        assert 'kiro_gateway_requests_by_status{status_class="2xx"} 1' in text
+        assert "kiro_gateway_prompt_tokens_total 100" in text
+        assert "kiro_gateway_completion_tokens_total 20" in text
+        assert text.endswith("\n")
+
+    def test_render_latency_histogram_is_cumulative_with_inf_and_count(self):
+        """
+        What it does: Histogram emits cumulative buckets, +Inf, _sum and _count.
+        Purpose: Conform to the Prometheus histogram contract.
+        """
+        obs.registry.record(_make_metrics(total_ms=300.0))
+        text = obs.render_prometheus()
+
+        # 300ms lands in le="500" (and above), not in le="250".
+        assert 'kiro_gateway_request_latency_ms_bucket{le="250"} 0' in text
+        assert 'kiro_gateway_request_latency_ms_bucket{le="500"} 1' in text
+        assert 'kiro_gateway_request_latency_ms_bucket{le="+Inf"} 1' in text
+        assert "kiro_gateway_request_latency_ms_count 1" in text
+        assert "kiro_gateway_request_latency_ms_sum 300.000" in text
+
+    def test_render_escapes_label_values(self):
+        """
+        What it does: Model names with quotes/backslashes are escaped in labels.
+        Purpose: Prevent malformed exposition (and label injection) from odd names.
+        """
+        obs.registry.record(_make_metrics(model='weird"\\name', status_code=200))
+        text = obs.render_prometheus()
+
+        assert 'kiro_gateway_requests_by_model{model="weird\\"\\\\name"} 1' in text
+
+    def test_render_is_stable_when_empty(self):
+        """
+        What it does: Rendering an empty registry still yields valid output.
+        Purpose: /metrics must work before any traffic.
+        """
+        text = obs.render_prometheus()
+        assert "kiro_gateway_requests_total 0" in text
+        assert 'kiro_gateway_request_latency_ms_bucket{le="+Inf"} 0' in text
+
+    def test_metrics_endpoint_returns_prometheus_text_unauthenticated(self):
+        """
+        What it does: GET /metrics returns 200 text/plain with the exposition and
+                      requires no authentication.
+        Purpose: Local Prometheus scraping must work without an API key.
+        """
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        obs.registry.record(_make_metrics(api="anthropic", status_code=200))
+
+        app = FastAPI()
+        app.include_router(obs.metrics_router)
+        client = TestClient(app)
+
+        response = client.get("/metrics")  # no Authorization / x-api-key header
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/plain")
+        assert "kiro_gateway_requests_total" in response.text
+        assert 'kiro_gateway_requests_by_api{api="anthropic"}' in response.text

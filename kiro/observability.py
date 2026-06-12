@@ -59,6 +59,8 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
+from fastapi import APIRouter, Response
+
 from kiro.config import (
     OBSERVABILITY_ENABLED,
     OBSERVABILITY_JSONL_ENABLED,
@@ -642,3 +644,120 @@ def _content_length(scope: Dict[str, Any]) -> Optional[int]:
             except (TypeError, ValueError):
                 return None
     return None
+
+
+# ==================================================================================================
+# Prometheus exposition
+# ==================================================================================================
+
+# Metric name prefix for all exported series.
+_PROM_PREFIX = "kiro_gateway"
+
+
+def _prom_escape_label(value: str) -> str:
+    """
+    Escape a Prometheus label value per the exposition format.
+
+    Args:
+        value: Raw label value.
+
+    Returns:
+        The value with backslash, double-quote, and newline escaped.
+    """
+    return value.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n")
+
+
+def _format_le(bound: float) -> str:
+    """
+    Format a histogram bucket bound as a Prometheus ``le`` value.
+
+    Args:
+        bound: Upper bound in milliseconds.
+
+    Returns:
+        An integer string when the bound is whole (e.g. "500"), else its repr.
+    """
+    return str(int(bound)) if float(bound).is_integer() else repr(bound)
+
+
+def render_prometheus() -> str:
+    """
+    Render the current registry as Prometheus text exposition (version 0.0.4).
+
+    Produces labelled counters for the request dimensions, a cumulative latency
+    histogram, token/retry counters, and a first-token summary (sum/count). The
+    output is a consistent snapshot taken under the registry lock.
+
+    Returns:
+        The exposition text, terminated by a trailing newline.
+    """
+    snap = registry.snapshot()
+    lines: List[str] = []
+
+    def counter(name: str, help_text: str, value: int) -> None:
+        """Emit a single unlabelled counter series."""
+        lines.append(f"# HELP {_PROM_PREFIX}_{name} {help_text}")
+        lines.append(f"# TYPE {_PROM_PREFIX}_{name} counter")
+        lines.append(f"{_PROM_PREFIX}_{name} {value}")
+
+    def labelled(name: str, help_text: str, label: str, mapping: Dict[str, int]) -> None:
+        """Emit a labelled counter series (one line per label value)."""
+        lines.append(f"# HELP {_PROM_PREFIX}_{name} {help_text}")
+        lines.append(f"# TYPE {_PROM_PREFIX}_{name} counter")
+        for key, value in sorted(mapping.items()):
+            lines.append(
+                f'{_PROM_PREFIX}_{name}{{{label}="{_prom_escape_label(key)}"}} {value}'
+            )
+
+    counter("requests_total", "Total HTTP requests observed.", snap["requests_total"])
+    labelled("requests_by_status", "Requests by HTTP status class.", "status_class", snap["by_status_class"])
+    labelled("requests_by_api", "Requests by logical API surface.", "api", snap["by_api"])
+    labelled("requests_by_outcome", "Requests by outcome.", "outcome", snap["by_outcome"])
+    labelled("requests_by_error", "Requests by network error category.", "category", snap["by_error_category"])
+    labelled("requests_by_model", "Requests by requested model.", "model", snap["by_model"])
+    counter("prompt_tokens_total", "Total estimated prompt tokens.", snap["prompt_tokens_total"])
+    counter("completion_tokens_total", "Total generated completion tokens.", snap["completion_tokens_total"])
+    counter("upstream_retries_total", "Total upstream re-issues performed.", snap["retries_total"])
+
+    # Latency histogram. Buckets are cumulative ("le"); the implicit +Inf bucket
+    # equals the observation count.
+    lines.append(f"# HELP {_PROM_PREFIX}_request_latency_ms Request wall-clock latency in milliseconds.")
+    lines.append(f"# TYPE {_PROM_PREFIX}_request_latency_ms histogram")
+    buckets = snap["latency_buckets"]
+    for bound in LATENCY_BUCKETS_MS:
+        lines.append(
+            f'{_PROM_PREFIX}_request_latency_ms_bucket{{le="{_format_le(bound)}"}} {buckets.get(bound, 0)}'
+        )
+    lines.append(f'{_PROM_PREFIX}_request_latency_ms_bucket{{le="+Inf"}} {snap["latency_ms_count"]}')
+    lines.append(f'{_PROM_PREFIX}_request_latency_ms_sum {snap["latency_ms_sum"]:.3f}')
+    lines.append(f'{_PROM_PREFIX}_request_latency_ms_count {snap["latency_ms_count"]}')
+
+    # First-token latency as a summary (sum/count only; no quantiles).
+    lines.append(f"# HELP {_PROM_PREFIX}_first_token_ms Time-to-first-token in milliseconds (streaming).")
+    lines.append(f"# TYPE {_PROM_PREFIX}_first_token_ms summary")
+    lines.append(f'{_PROM_PREFIX}_first_token_ms_sum {snap["first_token_ms_sum"]:.3f}')
+    lines.append(f'{_PROM_PREFIX}_first_token_ms_count {snap["first_token_ms_count"]}')
+
+    return "\n".join(lines) + "\n"
+
+
+# Router exposing the Prometheus endpoint; included by the application in main.py.
+metrics_router = APIRouter()
+
+
+@metrics_router.get("/metrics")
+async def metrics_endpoint() -> Response:
+    """
+    Expose the in-process metrics in Prometheus text exposition format.
+
+    Unauthenticated by design: the gateway is intended to bind to a local
+    interface and this endpoint exposes only aggregate counters (no request
+    content and no credentials).
+
+    Returns:
+        A ``text/plain`` response with the Prometheus exposition body.
+    """
+    return Response(
+        content=render_prometheus(),
+        media_type="text/plain; version=0.0.4; charset=utf-8",
+    )

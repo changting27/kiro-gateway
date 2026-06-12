@@ -88,7 +88,7 @@ from kiro.routes_openai import router as openai_router
 from kiro.routes_anthropic import router as anthropic_router
 from kiro.exceptions import validation_exception_handler
 from kiro.debug_middleware import DebugLoggerMiddleware
-from kiro.observability import ObservabilityMiddleware, install_request_id_logging
+from kiro.observability import ObservabilityMiddleware, install_request_id_logging, metrics_router
 
 
 # --- Loguru Configuration ---
@@ -582,6 +582,9 @@ app.include_router(openai_router)
 
 # Anthropic-compatible API: /v1/messages
 app.include_router(anthropic_router)
+
+# Observability: Prometheus metrics exposition at GET /metrics (unauthenticated).
+app.include_router(metrics_router)
 
 
 # --- Uvicorn log config ---
