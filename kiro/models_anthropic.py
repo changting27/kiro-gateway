@@ -294,6 +294,60 @@ class SystemContentBlock(BaseModel):
 SystemPrompt = Union[str, List[SystemContentBlock], List[Dict[str, Any]]]
 
 
+def _extract_system_text(content: Any) -> str:
+    """
+    Extract plain text from a message's content (string or list of blocks).
+
+    Args:
+        content: A message ``content`` value - a string, or a list of content
+            blocks (dicts with a ``text`` field, or bare strings).
+
+    Returns:
+        The concatenated text, or an empty string when no text is present.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for block in content:
+            if isinstance(block, dict):
+                if block.get("type") == "text" and isinstance(block.get("text"), str):
+                    parts.append(block["text"])
+            elif isinstance(block, str):
+                parts.append(block)
+        return "\n".join(parts)
+    return ""
+
+
+def _merge_system_prompt(existing: Any, hoisted_texts: List[str]) -> Any:
+    """
+    Merge hoisted inline-system text into an existing top-level system prompt.
+
+    Preserves a list-form system prompt (used for prompt caching) by appending the
+    hoisted text as an extra text block; otherwise produces a single combined string.
+
+    Args:
+        existing: The current top-level ``system`` value (None, str, or list).
+        hoisted_texts: Text extracted from inline system-role messages, in order.
+
+    Returns:
+        The merged system prompt (str or list), or the joined hoisted text when no
+        system prompt existed.
+    """
+    hoisted = "\n\n".join(text for text in hoisted_texts if text)
+    if not hoisted:
+        return existing
+    if existing is None or existing == "":
+        return hoisted
+    if isinstance(existing, str):
+        return f"{existing}\n\n{hoisted}"
+    if isinstance(existing, list):
+        return list(existing) + [{"type": "text", "text": hoisted}]
+    return hoisted
+
+
 class AnthropicMessagesRequest(BaseModel):
     """
     Request to Anthropic Messages API (/v1/messages).
@@ -338,6 +392,52 @@ class AnthropicMessagesRequest(BaseModel):
     metadata: Optional[Dict[str, Any]] = None
 
     model_config = {"extra": "allow"}
+
+    @model_validator(mode="before")
+    @classmethod
+    def _hoist_inline_system_messages(cls, data: Any) -> Any:
+        """
+        Hoist inline ``role: "system"`` messages into the top-level system prompt.
+
+        Newer Claude Code clients place the system prompt as a system-role entry
+        inside the ``messages`` array rather than the dedicated ``system`` field.
+        The Anthropic spec only permits ``user``/``assistant`` roles in ``messages``,
+        so such requests would otherwise fail validation with HTTP 422 (issue #190).
+        This runs before field validation: it extracts the text of any system-role
+        messages, merges it into ``system`` (preserving an existing prompt), and
+        removes those entries so the remaining messages validate normally.
+
+        Args:
+            data: Raw request payload before field validation.
+
+        Returns:
+            The request payload with inline system messages hoisted into ``system``.
+        """
+        if not isinstance(data, dict):
+            return data
+        messages = data.get("messages")
+        if not isinstance(messages, list):
+            return data
+
+        hoisted_texts: List[str] = []
+        kept_messages: List[Any] = []
+        found_system = False
+        for message in messages:
+            if isinstance(message, dict) and message.get("role") == "system":
+                found_system = True
+                text = _extract_system_text(message.get("content"))
+                if text:
+                    hoisted_texts.append(text)
+                continue  # drop the system-role entry from messages
+            kept_messages.append(message)
+
+        if not found_system:
+            return data
+
+        merged = {**data, "messages": kept_messages}
+        if hoisted_texts:
+            merged["system"] = _merge_system_prompt(data.get("system"), hoisted_texts)
+        return merged
 
 
 class AnthropicCountTokensRequest(BaseModel):

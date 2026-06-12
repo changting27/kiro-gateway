@@ -1757,3 +1757,151 @@ class TestThinkingParameter:
         print(f"Comparing thinking: got={request.thinking}")
         assert request.thinking is not None
         assert request.thinking["type"] == "disabled"
+
+
+class TestInlineSystemMessageHoisting:
+    """
+    Tests for hoisting inline role="system" messages into the top-level system
+    prompt. Newer Claude Code clients inline a system-role entry in the messages
+    array; the Anthropic spec only allows user/assistant there, so without hoisting
+    the request 422s (issue #190, #211).
+    """
+
+    def test_inline_system_message_hoisted_to_system_prompt(self):
+        """
+        What it does: An inline system message becomes the top-level system prompt
+                      and is removed from messages.
+        Purpose: The exact #190/#211 failure must now validate, not 422.
+        """
+        req = AnthropicMessagesRequest(
+            model="claude-opus-4.8",
+            max_tokens=1024,
+            messages=[
+                {"role": "system", "content": "You are Claude Code."},
+                {"role": "user", "content": "hi"},
+            ],
+        )
+        assert [m.role for m in req.messages] == ["user"]
+        assert req.system == "You are Claude Code."
+
+    def test_inline_system_merged_with_existing_string_system(self):
+        """
+        What it does: Inline system text is appended to an existing string system.
+        Purpose: Don't clobber a client-provided top-level system prompt.
+        """
+        req = AnthropicMessagesRequest(
+            model="m", max_tokens=1, system="TOP",
+            messages=[
+                {"role": "system", "content": "INLINE"},
+                {"role": "user", "content": "hi"},
+            ],
+        )
+        assert req.system == "TOP\n\nINLINE"
+
+    def test_inline_system_content_blocks_text_extracted(self):
+        """
+        What it does: Text is extracted from a system message given as content blocks.
+        Purpose: Claude Code may send system content as a list of text blocks.
+        """
+        req = AnthropicMessagesRequest(
+            model="m", max_tokens=1,
+            messages=[
+                {"role": "system", "content": [
+                    {"type": "text", "text": "A"},
+                    {"type": "text", "text": "B"},
+                ]},
+                {"role": "user", "content": "hi"},
+            ],
+        )
+        assert req.system == "A\nB"
+
+    def test_existing_list_system_preserved_and_appended(self):
+        """
+        What it does: A list-form (cacheable) system prompt is preserved; hoisted
+                      text is appended as an extra text block.
+        Purpose: Avoid destroying prompt-caching structure when merging.
+        """
+        req = AnthropicMessagesRequest(
+            model="m", max_tokens=1,
+            system=[{"type": "text", "text": "CACHED"}],
+            messages=[
+                {"role": "system", "content": "INLINE"},
+                {"role": "user", "content": "hi"},
+            ],
+        )
+        assert isinstance(req.system, list)
+        assert len(req.system) == 2
+        assert req.system[0].text == "CACHED"
+        assert req.system[1].text == "INLINE"
+
+    def test_multiple_inline_system_messages_merged_in_order(self):
+        """
+        What it does: Multiple inline system messages are merged in original order.
+        Purpose: Preserve ordering/intent when several are present.
+        """
+        req = AnthropicMessagesRequest(
+            model="m", max_tokens=1,
+            messages=[
+                {"role": "system", "content": "S1"},
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "S2"},
+            ],
+        )
+        assert req.system == "S1\n\nS2"
+        assert [m.role for m in req.messages] == ["user"]
+
+    def test_no_inline_system_is_noop(self):
+        """
+        What it does: Requests without inline system messages are unchanged.
+        Purpose: Regression guard - the common path must not be altered.
+        """
+        req = AnthropicMessagesRequest(
+            model="m", max_tokens=1, system="KEEP",
+            messages=[{"role": "user", "content": "hi"}],
+        )
+        assert req.system == "KEEP"
+        assert [m.role for m in req.messages] == ["user"]
+
+    def test_empty_content_system_message_is_removed(self):
+        """
+        What it does: A system message with empty content is still removed (no 422),
+                      leaving the system prompt untouched.
+        Purpose: Edge case - an empty inline system entry must not crash validation.
+        """
+        req = AnthropicMessagesRequest(
+            model="m", max_tokens=1,
+            messages=[
+                {"role": "system", "content": ""},
+                {"role": "user", "content": "hi"},
+            ],
+        )
+        assert [m.role for m in req.messages] == ["user"]
+        assert req.system is None
+
+    def test_non_system_role_still_rejected(self):
+        """
+        What it does: A non-system, non-standard role still raises ValidationError.
+        Purpose: The fix is scoped to 'system'; other roles must not be silently
+                 accepted (they would indicate a different client bug).
+        """
+        with pytest.raises(ValidationError):
+            AnthropicMessagesRequest(
+                model="m", max_tokens=1,
+                messages=[
+                    {"role": "tool", "content": "x"},
+                    {"role": "user", "content": "hi"},
+                ],
+            )
+
+    def test_system_only_messages_still_rejected(self):
+        """
+        What it does: A request whose only message is a system message still fails
+                      (min_length=1 after hoisting removes it).
+        Purpose: A conversation with no user/assistant turn is malformed; document
+                 that hoisting does not paper over it.
+        """
+        with pytest.raises(ValidationError):
+            AnthropicMessagesRequest(
+                model="m", max_tokens=1,
+                messages=[{"role": "system", "content": "only system"}],
+            )
