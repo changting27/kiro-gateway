@@ -88,15 +88,19 @@ from kiro.routes_openai import router as openai_router
 from kiro.routes_anthropic import router as anthropic_router
 from kiro.exceptions import validation_exception_handler
 from kiro.debug_middleware import DebugLoggerMiddleware
+from kiro.observability import ObservabilityMiddleware, install_request_id_logging
 
 
 # --- Loguru Configuration ---
 logger.remove()
+# Install the request-id patcher and default BEFORE adding the sink, so the
+# format's {extra[request_id]} placeholder always resolves (full-link observability).
+install_request_id_logging()
 logger.add(
     sys.stderr,
     level=LOG_LEVEL,
     colorize=True,
-    format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>"
+    format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <magenta>{extra[request_id]}</magenta> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>"
 )
 
 
@@ -558,6 +562,14 @@ app.add_middleware(
 # Initializes debug logging BEFORE Pydantic validation
 # This allows capturing validation errors (422) in debug logs
 app.add_middleware(DebugLoggerMiddleware)
+
+
+# --- Observability Middleware ---
+# Added LAST so it is the outermost middleware: it assigns the request id and binds
+# the per-request metrics context before anything else runs, times the whole
+# request, captures the response status, injects the x-kiro-gateway-request-id
+# response header, and records the metrics once the response completes.
+app.add_middleware(ObservabilityMiddleware)
 
 
 # --- Validation Error Handler Registration ---

@@ -375,6 +375,23 @@ FIRST_TOKEN_MAX_RETRIES: int = int(os.getenv("FIRST_TOKEN_MAX_RETRIES", "3"))
 # Set to 1 to disable this recovery. Default: 2 (one retry after the initial attempt).
 NONSTREAM_INTERRUPT_MAX_ATTEMPTS: int = int(os.getenv("NONSTREAM_INTERRUPT_MAX_ATTEMPTS", "2"))
 
+
+# ==================================================================================================
+# Observability Settings
+# ==================================================================================================
+
+# Master switch for the full-link observability layer (request-id propagation,
+# per-request summary metrics, in-memory registry, optional JSONL sink). When
+# disabled, ObservabilityMiddleware becomes a passthrough and nothing is recorded.
+OBSERVABILITY_ENABLED: bool = os.getenv("OBSERVABILITY_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+
+# Write one JSON line per request to a rolling daily file for offline analysis.
+OBSERVABILITY_JSONL_ENABLED: bool = os.getenv("OBSERVABILITY_JSONL_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+
+# Directory for the rolling JSONL request log (created on first write). The file
+# name is requests-YYYYMMDD.jsonl, rotated by calendar day (UTC).
+OBSERVABILITY_LOG_DIR: str = os.getenv("OBSERVABILITY_LOG_DIR", "observability")
+
 # ==================================================================================================
 # Debug Settings
 # ==================================================================================================

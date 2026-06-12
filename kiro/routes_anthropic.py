@@ -52,6 +52,7 @@ from kiro.streaming_anthropic import (
     stream_with_first_token_retry_anthropic,
 )
 from kiro.streaming_core import collect_nonstreaming_with_retry
+from kiro.observability import enrich_current_metrics
 from kiro.http_client import KiroHttpClient
 from kiro.utils import generate_conversation_id
 from kiro.tokenizer import estimate_request_tokens
@@ -148,6 +149,14 @@ async def messages(
         HTTPException: On validation or API errors
     """
     logger.info(f"Request to /v1/messages (model={request_data.model}, stream={request_data.stream})")
+    # Observability: attach request semantics to the per-request metrics (no-op if disabled).
+    enrich_current_metrics(
+        api="anthropic",
+        model=request_data.model,
+        stream=bool(request_data.stream),
+        message_count=len(request_data.messages) if request_data.messages else 0,
+        tool_count=len(request_data.tools) if request_data.tools else 0,
+    )
     
     if anthropic_version:
         logger.debug(f"Anthropic-Version header: {anthropic_version}")

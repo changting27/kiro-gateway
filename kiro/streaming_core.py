@@ -39,6 +39,7 @@ from loguru import logger
 
 from kiro.parsers import AwsEventStreamParser, parse_bracket_tool_calls, deduplicate_tool_calls
 from kiro.network_errors import classify_network_error
+from kiro.observability import mark_first_token, note_retry
 from kiro.config import (
     FIRST_TOKEN_TIMEOUT,
     FIRST_TOKEN_MAX_RETRIES,
@@ -199,6 +200,8 @@ async def collect_nonstreaming_with_retry(
                 f"Upstream stream interrupted during non-streaming collection "
                 f"(attempt {attempt}/{max_attempts}); re-issuing request: {error}"
             )
+            # Observability: count this upstream re-issue (no-op if disabled).
+            note_retry()
             # Best-effort cleanup of the broken response before re-issuing. Closing
             # must never mask the interruption we are recovering from.
             try:
@@ -271,6 +274,8 @@ async def parse_kiro_stream(
                 timeout=first_token_timeout
             )
             logger.debug("First token received")
+            # Observability: record time-to-first-token (idempotent, no-op if disabled).
+            mark_first_token()
         except asyncio.TimeoutError:
             logger.warning(f"[FirstTokenTimeout] Model did not respond within {first_token_timeout}s")
             raise FirstTokenTimeoutError(f"No response within {first_token_timeout} seconds")

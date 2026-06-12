@@ -51,6 +51,7 @@ from kiro.model_resolver import ModelResolver
 from kiro.converters_openai import build_kiro_payload
 from kiro.streaming_openai import stream_kiro_to_openai, collect_stream_response, stream_with_first_token_retry
 from kiro.streaming_core import collect_nonstreaming_with_retry
+from kiro.observability import enrich_current_metrics
 from kiro.http_client import KiroHttpClient
 from kiro.utils import generate_conversation_id
 from kiro.config import WEB_SEARCH_ENABLED
@@ -179,6 +180,14 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
         HTTPException: On validation or API errors
     """
     logger.info(f"Request to /v1/chat/completions (model={request_data.model}, stream={request_data.stream})")
+    # Observability: attach request semantics to the per-request metrics (no-op if disabled).
+    enrich_current_metrics(
+        api="openai",
+        model=request_data.model,
+        stream=bool(request_data.stream),
+        message_count=len(request_data.messages) if request_data.messages else 0,
+        tool_count=len(request_data.tools) if request_data.tools else 0,
+    )
     
     # Note: prepare_new_request() and log_request_body() are now called by DebugLoggerMiddleware
     # This ensures debug logging works even for requests that fail Pydantic validation (422 errors)

@@ -21,6 +21,7 @@ build/
 
 # Debug logs (generated when DEBUG_MODE is enabled)
 debug_logs*/
+observability/
 debug*.json
 
 # Project-specific

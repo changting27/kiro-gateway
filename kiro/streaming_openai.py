@@ -44,6 +44,7 @@ from kiro.config import (
     FAKE_REASONING_HANDLING,
 )
 from kiro.tokenizer import count_tokens, count_message_tokens, count_tools_tokens
+from kiro.observability import add_token_usage
 
 # Import from streaming_core - reuse shared parsing logic
 from kiro.streaming_core import (
@@ -404,6 +405,10 @@ async def stream_kiro_to_openai_internal(
         
         if metering_data:
             final_chunk["usage"]["credits_used"] = metering_data
+        
+        # Observability: record final token usage (covers OpenAI streaming and
+        # non-streaming, which both consume this generator). No-op if disabled.
+        add_token_usage(prompt_tokens, completion_tokens)
         
         # Log final token values being sent to client
         logger.debug(

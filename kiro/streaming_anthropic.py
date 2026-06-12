@@ -48,6 +48,7 @@ from kiro.streaming_core import (
     stream_with_first_token_retry,
 )
 from kiro.tokenizer import count_tokens, estimate_request_tokens
+from kiro.observability import add_token_usage
 from kiro.parsers import parse_bracket_tool_calls, deduplicate_tool_calls
 from kiro.config import FIRST_TOKEN_TIMEOUT, FIRST_TOKEN_MAX_RETRIES, FAKE_REASONING_HANDLING
 
@@ -691,6 +692,8 @@ async def stream_kiro_to_anthropic(
             f"input_tokens={input_tokens}, output_tokens={output_tokens}, "
             f"tool_blocks={len(tool_blocks)}, stop_reason={stop_reason}"
         )
+        # Observability: record final token usage for Anthropic streaming (no-op if disabled).
+        add_token_usage(input_tokens, output_tokens)
         
     except FirstTokenTimeoutError:
         raise
@@ -844,6 +847,8 @@ async def collect_anthropic_response(
         f"input_tokens={input_tokens}, output_tokens={output_tokens}, "
         f"tool_calls={len(result.tool_calls)}, stop_reason={stop_reason}"
     )
+    # Observability: record final token usage for Anthropic non-streaming (no-op if disabled).
+    add_token_usage(input_tokens, output_tokens)
     
     usage_payload: Dict[str, Any] = {
         "input_tokens": input_tokens,
