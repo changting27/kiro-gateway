@@ -38,6 +38,7 @@ from loguru import logger
 
 from kiro.parsers import parse_bracket_tool_calls, deduplicate_tool_calls
 from kiro.utils import generate_completion_id
+from kiro.tool_names import build_tool_name_restore_map, restore_tool_name
 from kiro.config import (
     FIRST_TOKEN_TIMEOUT,
     FIRST_TOKEN_MAX_RETRIES,
@@ -127,6 +128,10 @@ async def stream_kiro_to_openai_internal(
     streaming_error_occurred = False
     tool_calls_from_stream = []
     
+    # Per-request reverse map to restore tool names that were normalized for Kiro's
+    # 64-char limit. Built from the original request tools; empty when nothing changed.
+    tool_name_restore_map = build_tool_name_restore_map(request_tools)
+    
     try:
         # Use streaming_core.parse_kiro_stream for unified event parsing
         # This handles AWS SSE parsing, first token timeout, and thinking parser
@@ -192,6 +197,8 @@ async def stream_kiro_to_openai_internal(
                 tool_name = ""
                 if tool:
                     tool_name = (tool.get("function") or {}).get("name", "") or tool.get("name", "")
+                # Restore the original tool name (reverse the Kiro 64-char normalization)
+                tool_name = restore_tool_name(tool_name, tool_name_restore_map)
                 
                 # ==============================================================================
                 # WebSearch Support - Path B: MCP Tool Emulation (Streaming Interception)
@@ -338,6 +345,8 @@ async def stream_kiro_to_openai_internal(
                 func = tc.get("function") or {}
                 # Use "or" for protection against explicit None in values
                 tool_name = func.get("name") or ""
+                # Restore the original tool name (reverse the Kiro 64-char normalization)
+                tool_name = restore_tool_name(tool_name, tool_name_restore_map)
                 tool_args = func.get("arguments") or "{}"
                 
                 logger.debug(f"Tool call [{idx}] '{tool_name}': id={tc.get('id')}, args_length={len(tool_args)}")

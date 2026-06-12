@@ -1667,3 +1667,97 @@ class TestStreamingAnthropicTruncationDetection:
         # Should detect truncation and set max_tokens
         assert result["stop_reason"] == "max_tokens"
         print("✓ collect_anthropic_response detects truncation correctly")
+
+
+# ==================================================================================================
+# Tests for tool-name restoration (reverse of Kiro 64-char normalization) — Anthropic
+# ==================================================================================================
+
+class TestAnthropicToolNameRestoration:
+    """
+    Verify that tool names normalized for Kiro's 64-char limit are restored to the
+    client's original names in Anthropic responses — for BOTH streaming and
+    non-streaming paths.
+    """
+
+    LONG = "mcp__plugin_chrome-devtools-mcp_chrome-devtools__performance_analyze_insight"  # 76 chars
+
+    @pytest.mark.asyncio
+    async def test_streaming_restores_original_tool_name(self, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Streaming restores the original (long) tool name before emitting
+                      the tool_use block, given request_tools with the original name.
+        Purpose: The client must see the name it registered, never the Kiro alias.
+        """
+        from kiro.tool_names import normalize_tool_name
+        norm = normalize_tool_name(self.LONG)
+        assert norm != self.LONG
+
+        async def mock_parse(*args, **kwargs):
+            yield KiroEvent(
+                type="tool_use",
+                tool_use={"id": "toolu_1", "function": {"name": norm, "arguments": "{}"}},
+            )
+
+        events = []
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse):
+            with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
+                async for e in stream_kiro_to_anthropic(
+                    mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager,
+                    request_tools=[{"name": self.LONG, "description": "d", "input_schema": {}}],
+                ):
+                    events.append(e)
+
+        blob = "".join(events)
+        assert self.LONG in blob, "original tool name must be restored in the stream"
+        assert norm not in blob, "normalized alias must not leak to the client"
+
+    @pytest.mark.asyncio
+    async def test_streaming_without_request_tools_is_noop(self, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: With no request_tools (empty restore map), names pass through.
+        Purpose: Restoration must never crash or mangle names when there is nothing to map.
+        """
+        async def mock_parse(*args, **kwargs):
+            yield KiroEvent(
+                type="tool_use",
+                tool_use={"id": "t", "function": {"name": "get_weather", "arguments": "{}"}},
+            )
+
+        events = []
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse):
+            with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
+                async for e in stream_kiro_to_anthropic(
+                    mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                ):
+                    events.append(e)
+
+        assert "get_weather" in "".join(events)
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_restores_original_tool_name(self, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Non-streaming (collect_anthropic_response) restores the original
+                      tool name in the tool_use content block.
+        Purpose: Cover the non-streaming path explicitly — it uses collect_stream_to_result,
+                 NOT the streaming generator, so it needs its own restoration.
+        """
+        from kiro.tool_names import normalize_tool_name
+        norm = normalize_tool_name(self.LONG)
+        mock_result = StreamResult(
+            content="",
+            thinking_content="",
+            tool_calls=[{"id": "toolu_1", "function": {"name": norm, "arguments": '{"a": 1}'}}],
+            usage=None,
+            context_usage_percentage=None,
+        )
+
+        with patch('kiro.streaming_anthropic.collect_stream_to_result', return_value=mock_result):
+            result = await collect_anthropic_response(
+                mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager,
+                request_tools=[{"name": self.LONG, "description": "d", "input_schema": {}}],
+            )
+
+        tool_blocks = [b for b in result["content"] if b.get("type") == "tool_use"]
+        assert len(tool_blocks) == 1
+        assert tool_blocks[0]["name"] == self.LONG

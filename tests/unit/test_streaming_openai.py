@@ -1485,3 +1485,78 @@ class TestStreamingOpenaiTruncationDetection:
         # Should extract "length" from streaming chunks
         assert result["choices"][0]["finish_reason"] == "length"
         print("✓ collect_stream_response extracts finish_reason correctly")
+
+
+# ==================================================================================================
+# Tests for tool-name restoration (reverse of Kiro 64-char normalization) — OpenAI
+# ==================================================================================================
+
+class TestOpenAIToolNameRestoration:
+    """
+    Verify that tool names normalized for Kiro's 64-char limit are restored to the
+    client's original names in OpenAI responses — for BOTH streaming and
+    non-streaming paths (the latter collects the streaming generator).
+    """
+
+    LONG = "mcp__plugin_chrome-devtools-mcp_chrome-devtools__performance_analyze_insight"  # 76 chars
+
+    @pytest.mark.asyncio
+    async def test_streaming_restores_original_tool_name(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: OpenAI streaming restores the original (long) tool name in the
+                      tool_calls delta, given request_tools with the original name.
+        Purpose: The client must see the name it registered, never the Kiro alias.
+        """
+        from kiro.tool_names import normalize_tool_name
+        norm = normalize_tool_name(self.LONG)
+        assert norm != self.LONG
+
+        async def mock_parse(*args, **kwargs):
+            yield KiroEvent(
+                type="tool_use",
+                tool_use={"id": "call_1", "type": "function", "function": {"name": norm, "arguments": "{}"}},
+            )
+
+        chunks = []
+        with patch('kiro.streaming_openai.parse_kiro_stream', mock_parse):
+            with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
+                async for c in stream_kiro_to_openai(
+                    mock_http_client, mock_response, "claude-sonnet-4",
+                    mock_model_cache, mock_auth_manager,
+                    request_tools=[{"type": "function", "function": {"name": self.LONG}}],
+                ):
+                    chunks.append(c)
+
+        blob = "".join(chunks)
+        assert self.LONG in blob, "original tool name must be restored in the stream"
+        assert norm not in blob, "normalized alias must not leak to the client"
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_restores_original_tool_name(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: OpenAI non-streaming (collect_stream_response) restores the
+                      original tool name in the collected tool_calls.
+        Purpose: Cover the non-streaming path; it reuses the streaming generator, so
+                 restoration must propagate through collection.
+        """
+        from kiro.tool_names import normalize_tool_name
+        from kiro.streaming_openai import collect_stream_response
+        norm = normalize_tool_name(self.LONG)
+
+        async def mock_parse(*args, **kwargs):
+            yield KiroEvent(
+                type="tool_use",
+                tool_use={"id": "call_1", "type": "function", "function": {"name": norm, "arguments": '{"a": 1}'}},
+            )
+
+        with patch('kiro.streaming_openai.parse_kiro_stream', mock_parse):
+            with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
+                result = await collect_stream_response(
+                    mock_http_client, mock_response, "claude-sonnet-4",
+                    mock_model_cache, mock_auth_manager,
+                    request_tools=[{"type": "function", "function": {"name": self.LONG}}],
+                )
+
+        blob = json.dumps(result)
+        assert self.LONG in blob, "original tool name must be restored in non-streaming result"
+        assert norm not in blob, "normalized alias must not leak to the client"

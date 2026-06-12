@@ -39,6 +39,7 @@ from typing import TYPE_CHECKING, AsyncGenerator, Dict, List, Optional, Any
 import httpx
 from loguru import logger
 
+from kiro.tool_names import build_tool_name_restore_map, restore_tool_name
 from kiro.streaming_core import (
     parse_kiro_stream,
     collect_stream_to_result,
@@ -166,6 +167,9 @@ async def stream_kiro_to_anthropic(
     output_tokens = 0
     full_content = ""
     full_thinking_content = ""
+    
+    # Per-request reverse map to restore tool names normalized for Kiro's 64-char limit.
+    tool_name_restore_map = build_tool_name_restore_map(request_tools)
     
     # NOTE: Anthropic streaming spec requires input_tokens in message_start (beginning),
     # but Kiro API provides accurate context_usage at the end of stream.
@@ -346,6 +350,8 @@ async def stream_kiro_to_anthropic(
                 tool = event.tool_use
                 tool_id = tool.get("id") or f"toolu_{uuid.uuid4().hex[:24]}"
                 tool_name = tool.get("function", {}).get("name", "") or tool.get("name", "")
+                # Restore the original tool name (reverse the Kiro 64-char normalization)
+                tool_name = restore_tool_name(tool_name, tool_name_restore_map)
                 tool_input = tool.get("function", {}).get("arguments", {}) or tool.get("input", {})
                 
                 # ==============================================================================
@@ -765,6 +771,9 @@ async def collect_anthropic_response(
     
     # Collect stream result
     result = await collect_stream_to_result(response)
+    
+    # Per-request reverse map to restore tool names normalized for Kiro's 64-char limit.
+    tool_name_restore_map = build_tool_name_restore_map(request_tools)
     upstream_cache_usage = _extract_cache_usage_fields(result.usage)
     
     # Build content blocks
@@ -794,6 +803,8 @@ async def collect_anthropic_response(
     for tc in result.tool_calls:
         tool_id = tc.get("id") or f"toolu_{uuid.uuid4().hex[:24]}"
         tool_name = tc.get("function", {}).get("name", "") or tc.get("name", "")
+        # Restore the original tool name (reverse the Kiro 64-char normalization)
+        tool_name = restore_tool_name(tool_name, tool_name_restore_map)
         tool_input = tc.get("function", {}).get("arguments", {}) or tc.get("input", {})
         
         if isinstance(tool_input, str):

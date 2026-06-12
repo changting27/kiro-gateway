@@ -45,6 +45,7 @@ from kiro.config import (
     AUTO_TRIM_PAYLOAD,
 )
 from kiro.payload_guards import check_payload_size, trim_payload_to_limit
+from kiro.tool_names import normalize_tool_name
 
 
 # ==================================================================================================
@@ -557,48 +558,6 @@ def process_tools_with_long_descriptions(
     return processed_tools if processed_tools else None, tool_documentation
 
 
-def validate_tool_names(tools: Optional[List[UnifiedTool]]) -> None:
-    """
-    Validates tool names against Kiro API 64-character limit.
-    
-    Logs WARNING for each problematic tool and raises ValueError
-    with complete list of violations.
-    
-    Args:
-        tools: List of tools to validate
-    
-    Raises:
-        ValueError: If any tool name exceeds 64 characters
-    
-    Example:
-        >>> validate_tool_names([UnifiedTool(name="short_name", description="test")])
-        # No error
-        >>> validate_tool_names([UnifiedTool(name="a" * 70, description="test")])
-        # Raises ValueError with detailed message
-    """
-    if not tools:
-        return
-    
-    problematic_tools = []
-    for tool in tools:
-        if len(tool.name) > 64:
-            problematic_tools.append((tool.name, len(tool.name)))
-    
-    if problematic_tools:
-        # Build detailed error message for client (no logging here - routes will log)
-        tool_list = "\n".join([
-            f"  - '{name}' ({length} characters)"
-            for name, length in problematic_tools
-        ])
-        
-        raise ValueError(
-            f"Tool name(s) exceed Kiro API limit of 64 characters:\n"
-            f"{tool_list}\n\n"
-            f"Solution: Use shorter tool names (max 64 characters).\n"
-            f"Example: 'get_user_data' instead of 'get_authenticated_user_profile_data_with_extended_information_about_it'"
-        )
-
-
 def convert_tools_to_kiro_format(tools: Optional[List[UnifiedTool]]) -> List[Dict[str, Any]]:
     """
     Converts unified tools to Kiro API format.
@@ -625,7 +584,7 @@ def convert_tools_to_kiro_format(tools: Optional[List[UnifiedTool]]) -> List[Dic
         
         kiro_tools.append({
             "toolSpecification": {
-                "name": tool.name,
+                "name": normalize_tool_name(tool.name),
                 "description": description,
                 "inputSchema": {"json": sanitized_params}
             }
@@ -801,7 +760,7 @@ def extract_tool_uses_from_message(
                 else:
                     input_data = arguments if arguments else {}
                 tool_uses.append({
-                    "name": func.get("name", ""),
+                    "name": normalize_tool_name(func.get("name", "")),
                     "input": input_data,
                     "toolUseId": tc.get("id", "")
                 })
@@ -811,7 +770,7 @@ def extract_tool_uses_from_message(
         for item in content:
             if isinstance(item, dict) and item.get("type") == "tool_use":
                 tool_uses.append({
-                    "name": item.get("name", ""),
+                    "name": normalize_tool_name(item.get("name", "")),
                     "input": item.get("input", {}),
                     "toolUseId": item.get("id", "")
                 })
@@ -1435,8 +1394,10 @@ def build_kiro_payload(
     # Process tools with long descriptions
     processed_tools, tool_documentation = process_tools_with_long_descriptions(tools)
     
-    # Validate tool names against Kiro API 64-character limit
-    validate_tool_names(processed_tools)
+    # Tool names that violate Kiro's 64-character / charset limit are normalized
+    # transparently at conversion time (convert_tools_to_kiro_format and
+    # extract_tool_uses_from_message both call normalize_tool_name). Response names
+    # are restored per-request via kiro.tool_names. We no longer reject such requests.
     
     # Add tool documentation to system prompt if present
     full_system_prompt = system_prompt
