@@ -41,6 +41,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from loguru import logger
 
 from kiro.tokenizer import count_message_tokens, count_tokens
+from kiro.utils import get_kiro_headers
+from kiro.config import PROFILE_ARN
 
 # Import debug_logger
 try:
@@ -133,7 +135,10 @@ async def call_kiro_mcp_api(
         "params": {
             "name": "web_search",
             "arguments": {"query": query}
-        }
+        },
+        # The /mcp endpoint requires profileArn (else HTTP 400 "profileArn is
+        # required"), mirroring the completion payload built in converters_core.
+        "profileArn": auth_manager.profile_arn or PROFILE_ARN or ""
     }
     
     # Log MCP request
@@ -147,12 +152,18 @@ async def call_kiro_mcp_api(
     try:
         token = await auth_manager.get_access_token()
         
-        # EXACT headers from architecture
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "x-amzn-codewhisperer-optout": "false",
-            "Content-Type": "application/json"
-        }
+        # The /mcp endpoint authorizes on the full Kiro client-identity header set
+        # (User-Agent KiroIDE signature, x-amz-user-agent, x-amzn-kiro-agent-mode);
+        # a bare Authorization header is rejected with HTTP 403 even when the account
+        # is entitled. Reuse the canonical headers from the completion path (single
+        # source of truth) and override only what differs for /mcp:
+        #   - Content-Type: application/json (/mcp is JSON-RPC, not x-amz-json-1.0)
+        #   - drop x-amz-target (completion-specific operation target)
+        #   - keep the opt-out flag explicitly "false"
+        headers = get_kiro_headers(auth_manager, token)
+        headers["Content-Type"] = "application/json"
+        headers.pop("x-amz-target", None)
+        headers["x-amzn-codewhisperer-optout"] = "false"
         
         mcp_url = f"{auth_manager.q_host}/mcp"
         logger.debug(f"Calling MCP API: {mcp_url}")
@@ -161,7 +172,11 @@ async def call_kiro_mcp_api(
             response = await client.post(mcp_url, json=mcp_request, headers=headers)
             
             if response.status_code != 200:
-                logger.error(f"MCP API error: {response.status_code}")
+                # Log the upstream response body so MCP failures are
+                # self-explanatory (e.g. 400 "profileArn is required",
+                # 403 "User is not authorized") instead of an opaque status code.
+                error_body = response.text
+                logger.error(f"MCP API error: {response.status_code} - {error_body[:500]}")
                 return None, None
             
             mcp_response = response.json()

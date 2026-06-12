@@ -148,6 +148,92 @@ class TestCallKiroMCPAPI:
         assert results["results"][0]["url"] == "https://python.org"
     
     @pytest.mark.asyncio
+    async def test_mcp_api_sends_kiro_identity_headers(self, mock_auth_manager):
+        """
+        What it does: Verifies the /mcp call sends the full Kiro client-identity headers.
+        Purpose: Guard against the 403 regression - /mcp rejects a bare Authorization
+                 header; it gates authorization on the KiroIDE User-Agent signature
+                 and agent-mode headers (same identity the completion path sends).
+        """
+        print("Setup: Mocking a successful MCP response to capture request headers...")
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json = Mock(return_value={
+            "jsonrpc": "2.0", "result": {"content": [{"type": "text", "text": "{}"}]}
+        })
+        mock_post = AsyncMock(return_value=mock_response)
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value.post = mock_post
+
+        print("Action: Calling call_kiro_mcp_api and inspecting posted headers...")
+        with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client):
+            await call_kiro_mcp_api("test query", mock_auth_manager)
+
+        headers = mock_post.call_args.kwargs["headers"]
+        print(f"User-Agent: {headers.get('User-Agent')}")
+        # Full Kiro client identity (fixes 403):
+        assert "KiroIDE" in headers["User-Agent"]
+        assert str(mock_auth_manager.fingerprint) in headers["User-Agent"]
+        assert "KiroIDE" in headers["x-amz-user-agent"]
+        assert headers["x-amzn-kiro-agent-mode"] == "vibe"
+        assert headers["Authorization"].startswith("Bearer ")
+        # /mcp-specific overrides:
+        assert headers["Content-Type"] == "application/json"
+        assert "x-amz-target" not in headers
+        assert headers["x-amzn-codewhisperer-optout"] == "false"
+
+    @pytest.mark.asyncio
+    async def test_mcp_api_request_body_includes_profile_arn(self, mock_auth_manager):
+        """
+        What it does: Verifies profileArn is included in the MCP JSON-RPC body.
+        Purpose: Guard against the 400 "profileArn is required" regression.
+        """
+        print("Setup: Mocking a successful MCP response to capture request body...")
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json = Mock(return_value={
+            "jsonrpc": "2.0", "result": {"content": [{"type": "text", "text": "{}"}]}
+        })
+        mock_post = AsyncMock(return_value=mock_response)
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value.post = mock_post
+
+        print("Action: Calling call_kiro_mcp_api and inspecting posted body...")
+        with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client):
+            await call_kiro_mcp_api("test query", mock_auth_manager)
+
+        body = mock_post.call_args.kwargs["json"]
+        print(f"profileArn in body: {body.get('profileArn')}")
+        assert body["profileArn"] == mock_auth_manager.profile_arn
+        assert body["profileArn"]  # non-empty
+
+    @pytest.mark.asyncio
+    async def test_mcp_api_non_200_logs_response_body(self, mock_auth_manager):
+        """
+        What it does: A non-200 MCP response logs the upstream body and returns (None, None).
+        Purpose: Close the observability gap - failures like 403 "User is not authorized"
+                 must be visible in logs, not reduced to a bare status code.
+        """
+        print("Setup: Mocking a 403 MCP response with an explanatory body...")
+        mock_response = Mock()
+        mock_response.status_code = 403
+        mock_response.text = '{"message":"User is not authorized to make this call.","reason":null}'
+        mock_post = AsyncMock(return_value=mock_response)
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value.post = mock_post
+
+        print("Action: Calling call_kiro_mcp_api with logger patched...")
+        with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client):
+            with patch("kiro.mcp_tools.logger") as mock_logger:
+                tool_use_id, results = await call_kiro_mcp_api("test query", mock_auth_manager)
+
+        assert tool_use_id is None and results is None
+        logged = " ".join(str(c.args[0]) for c in mock_logger.error.call_args_list if c.args)
+        print(f"Logged error text: {logged}")
+        assert "403" in logged
+        assert "User is not authorized" in logged
+
+    @pytest.mark.asyncio
     async def test_mcp_api_error_response(self, mock_auth_manager):
         """
         What it does: Verifies handling of MCP API error response.
@@ -190,6 +276,7 @@ class TestCallKiroMCPAPI:
         
         mock_response = Mock()
         mock_response.status_code = 500
+        mock_response.text = '{"message":"internal error","reason":null}'
         
         mock_post = AsyncMock(return_value=mock_response)
         mock_client = AsyncMock()
