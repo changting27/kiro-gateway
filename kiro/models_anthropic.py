@@ -163,6 +163,23 @@ class ImageContentBlock(BaseModel):
 
 
 # Union type for all content blocks (including images and thinking)
+class GenericContentBlock(BaseModel):
+    """
+    Forward-compatible fallback for content blocks the gateway does not model
+    explicitly (e.g. ``document`` PDFs, ``redacted_thinking``, or future Anthropic
+    block types). Captures the ``type`` and preserves all other fields so a request
+    using such a block validates instead of failing with HTTP 422 (issues #176, #82).
+
+    The converters handle only the block types they understand and skip the rest, so
+    an unmodelled block is accepted and passed through without crashing the request.
+    Note: such blocks are not translated to Kiro - their payload (e.g. a PDF) is not
+    forwarded - this only prevents a hard 422 on the whole request.
+    """
+
+    type: str
+    model_config = {"extra": "allow"}
+
+
 ContentBlock = Union[
     TextContentBlock,
     ThinkingContentBlock,
@@ -170,6 +187,7 @@ ContentBlock = Union[
     ToolUseContentBlock,
     ToolResultContentBlock,
     ToolReferenceContentBlock,
+    GenericContentBlock,
 ]
 
 

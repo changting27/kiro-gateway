@@ -69,7 +69,7 @@ def convert_anthropic_content_to_text(content: Any) -> str:
                 if block.get("type") == "text":
                     text_parts.append(block.get("text", ""))
             elif hasattr(block, "type") and block.type == "text":
-                text_parts.append(block.text)
+                text_parts.append(getattr(block, "text", "") or "")
         return "".join(text_parts)
 
     return str(content) if content else ""

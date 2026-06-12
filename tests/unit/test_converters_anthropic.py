@@ -1884,3 +1884,33 @@ class TestAnthropicToKiroIntegration:
         print(f"Checking for <max_thinking_length>6000</max_thinking_length>...")
         assert "<max_thinking_length>6000</max_thinking_length>" in content
         assert "<thinking_mode>enabled</thinking_mode>" in content
+
+
+class TestForwardCompatibleContentBlockConversion:
+    """
+    Tests that text extraction tolerates unmodelled/generic content blocks (and a
+    text block lacking its text field) without crashing, preserving real text.
+    """
+
+    def test_extract_text_skips_generic_blocks_and_preserves_text(self):
+        """
+        What it does: extract_text_content returns the real text and skips
+                      document/redacted_thinking/malformed-text blocks.
+        Purpose: A PDF or future block in the conversation must not break conversion
+                 (only text is forwarded; unmodelled blocks are ignored, not fatal).
+        """
+        from kiro.converters_anthropic import extract_text_content
+        from kiro.models_anthropic import AnthropicMessagesRequest
+
+        msg = AnthropicMessagesRequest(
+            model="m", max_tokens=1,
+            messages=[{"role": "user", "content": [
+                {"type": "text", "text": "hello"},
+                {"type": "document", "source": {
+                    "type": "base64", "media_type": "application/pdf", "data": "JVBERi0="}},
+                {"type": "text"},  # malformed -> generic, no text attr
+                {"type": "redacted_thinking", "data": "x"},
+            ]}],
+        ).messages[0]
+
+        assert extract_text_content(msg.content) == "hello"

@@ -1905,3 +1905,84 @@ class TestInlineSystemMessageHoisting:
                 model="m", max_tokens=1,
                 messages=[{"role": "system", "content": "only system"}],
             )
+
+
+class TestForwardCompatibleContentBlocks:
+    """
+    Tests that unmodelled content blocks (document/PDF, redacted_thinking, future
+    types) are accepted as a generic fallback instead of failing with HTTP 422
+    (issues #176, #82, #164). Known block types must still parse to their specific
+    models.
+    """
+
+    def _first_block(self, content):
+        """Build a one-message request and return its first content block."""
+        req = AnthropicMessagesRequest(
+            model="m", max_tokens=1,
+            messages=[{"role": "user", "content": content}],
+        )
+        return req.messages[0].content[0]
+
+    def test_document_pdf_block_accepted_as_generic(self):
+        """
+        What it does: A document (PDF) block validates as GenericContentBlock.
+        Purpose: Claude Code attaching a PDF must not 422 the whole request (#176).
+        """
+        from kiro.models_anthropic import GenericContentBlock
+        block = self._first_block([{
+            "type": "document",
+            "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0="},
+        }])
+        assert isinstance(block, GenericContentBlock)
+        assert block.type == "document"
+
+    def test_redacted_thinking_block_accepted_as_generic(self):
+        """
+        What it does: A redacted_thinking block validates as GenericContentBlock.
+        Purpose: Extended-thinking multi-turn echoes these back; they must not 422.
+        """
+        from kiro.models_anthropic import GenericContentBlock
+        block = self._first_block([{"type": "redacted_thinking", "data": "abc"}])
+        assert isinstance(block, GenericContentBlock)
+        assert block.type == "redacted_thinking"
+
+    def test_unknown_future_block_accepted_as_generic_and_preserves_fields(self):
+        """
+        What it does: An unknown future block validates as GenericContentBlock and
+                      keeps its extra fields.
+        Purpose: Forward compatibility for new Anthropic block types.
+        """
+        from kiro.models_anthropic import GenericContentBlock
+        block = self._first_block([{"type": "some_future_block", "x": 1}])
+        assert isinstance(block, GenericContentBlock)
+        assert block.type == "some_future_block"
+        assert getattr(block, "x", None) == 1
+
+    def test_known_blocks_still_resolve_to_specific_models(self):
+        """
+        What it does: text/image/tool_use still parse to their specific models.
+        Purpose: The generic fallback must not shadow well-formed known blocks.
+        """
+        from kiro.models_anthropic import (
+            TextContentBlock, ImageContentBlock, ToolUseContentBlock,
+        )
+        assert isinstance(self._first_block([{"type": "text", "text": "hi"}]), TextContentBlock)
+        assert isinstance(self._first_block([{
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": "aGk="},
+        }]), ImageContentBlock)
+        assert isinstance(self._first_block([{
+            "type": "tool_use", "id": "t1", "name": "f", "input": {},
+        }]), ToolUseContentBlock)
+
+    def test_malformed_text_block_does_not_422(self):
+        """
+        What it does: A text block missing its text field no longer 422s; it falls
+                      back to a generic block.
+        Purpose: The generic fallback must turn a former hard failure into a
+                 tolerable degraded block, not crash validation.
+        """
+        from kiro.models_anthropic import GenericContentBlock
+        block = self._first_block([{"type": "text"}])
+        assert isinstance(block, GenericContentBlock)
+        assert block.type == "text"
