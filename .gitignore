@@ -24,6 +24,9 @@ debug_logs*/
 observability/
 debug*.json
 
+# Runtime server log (stdout/stderr of `python main.py`)
+.gateway.log
+
 # Project-specific
 _notes/
 requests/

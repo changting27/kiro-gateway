@@ -11,11 +11,10 @@ Made with ❤️ by [@Jwadow](https://github.com/jwadow)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-green.svg)](https://fastapi.tiangolo.com/)
-[![Sponsor](https://img.shields.io/badge/💖_Sponsor-Support_Development-ff69b4)](#-support-the-project)
 
 *Use Claude models from Kiro with Claude Code, OpenCode, OpenClaw, Claw Code, Codex app, Cursor, Cline, Roo Code, Kilo Code, Obsidian, OpenAI SDK, LangChain, Continue and other OpenAI or Anthropic compatible tools*
 
-[Models](#-supported-models) • [Features](#-features) • [Quick Start](#-quick-start) • [Configuration](#%EF%B8%8F-configuration) • [💖 Sponsor](#-support-the-project)
+[Models](#-supported-models) • [Features](#-features) • [Quick Start](#-quick-start) • [Configuration](#%EF%B8%8F-configuration)
 
 </div>
 
@@ -517,6 +516,7 @@ Leave `VPN_PROXY_URL` empty (default) if you don't need proxy support.
 | `/v1/models` | GET | List available models |
 | `/v1/chat/completions` | POST | OpenAI Chat Completions API |
 | `/v1/messages` | POST | Anthropic Messages API |
+| `/metrics` | GET | Prometheus metrics (per-request observability) |
 
 ---
 
@@ -823,38 +823,6 @@ By submitting a contribution to this project, you agree to the terms of our [Con
 - You have the right to submit the contribution
 - You grant the maintainer rights to use and relicense your contribution
 - The project remains legally protected
-
----
-
-## 💖 Support the Project
-
-<div align="center">
-
-<img src="https://raw.githubusercontent.com/Tarikul-Islam-Anik/Animated-Fluent-Emojis/master/Emojis/Smilies/Smiling%20Face%20with%20Hearts.png" alt="Love" width="80" />
-
-**If this project saved you time or money, consider supporting it!**
-
-Every contribution helps keep this project alive and growing
-
-<br>
-
-### 🤑 Donate
-
-[**☕ One-time Support**](https://app.lava.top/products/b4e34d12-3b6b-49b7-be50-50b6a20ed262/f3ea941f-de73-4ad1-bbb6-f82042ef8132)
-
-<br>
-
-### 🪙 Or send crypto
-
-| Currency | Network | Address |
-|:--------:|:-------:|:--------|
-| **USDT** | TRC20 | `TSVtgRc9pkC1UgcbVeijBHjFmpkYHDRu26` |
-| **BTC** | Bitcoin | `12GZqxqpcBsqJ4Vf1YreLqwoMGvzBPgJq6` |
-| **ETH** | Ethereum | `0xc86eab3bba3bbaf4eb5b5fff8586f1460f1fd395` |
-| **SOL** | Solana | `9amykF7KibZmdaw66a1oqYJyi75fRqgdsqnG66AK3jvh` |
-| **TON** | TON | `UQBVh8T1H3GI7gd7b-_PPNnxHYYxptrcCVf3qQk5v41h3QTM` |
-
-</div>
 
 ---
 
