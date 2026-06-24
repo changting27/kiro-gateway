@@ -688,3 +688,188 @@ class TestDebugLoggerAppLogsCapture:
             print(f"Проверяем, что app_logs.txt НЕ создан...")
             app_logs_file = debug_dir / "app_logs.txt"
             assert not app_logs_file.exists()
+
+
+def _make_logger(debug_dir):
+    """
+    Build a fresh DebugLogger instance bound to a temp directory.
+
+    The logger is a singleton, so tests recreate the instance to avoid state
+    bleed between cases (matches the pattern used throughout this file).
+
+    Args:
+        debug_dir: Directory the logger should write artifacts into.
+
+    Returns:
+        A freshly-initialized DebugLogger pointed at debug_dir.
+    """
+    from kiro.debug_logger import DebugLogger
+    dbg_logger = DebugLogger.__new__(DebugLogger)
+    dbg_logger._initialized = False
+    dbg_logger.__init__()
+    dbg_logger.debug_dir = debug_dir
+    return dbg_logger
+
+
+class TestDebugLoggerRequestFlush:
+    """
+    Tests for request_flush() forcing buffered artifacts to be persisted on an
+    otherwise-successful (HTTP 200) request - the Kiro tool-call truncation case.
+    """
+
+    def test_request_flush_then_discard_writes_buffers_in_errors_mode(self, tmp_path):
+        """
+        What it does: After request_flush(), discard_buffers() flushes the raw
+            stream and request bodies to disk in "errors" mode.
+        Purpose: Tool-call truncation returns HTTP 200, so the success path
+            (discard_buffers) must persist evidence instead of dropping it.
+        """
+        debug_dir = tmp_path / "debug_logs"
+        with patch('kiro.debug_logger.DEBUG_MODE', 'errors'):
+            # Arrange
+            dbg_logger = _make_logger(debug_dir)
+            dbg_logger.log_request_body(b'{"model": "claude-opus-4.6"}')
+            dbg_logger.log_raw_chunk(b'{"toolUseId":"x","name":"Write"}')
+
+            # Act
+            dbg_logger.request_flush(
+                reason="Tool call truncated by Kiro API: tool='Write', size=64 bytes",
+                status_code=200,
+            )
+            dbg_logger.discard_buffers()
+
+            # Assert
+            assert (debug_dir / "response_stream_raw.txt").exists()
+            assert (debug_dir / "request_body.json").exists()
+            assert (debug_dir / "error_info.json").exists()
+            error_info = json.loads((debug_dir / "error_info.json").read_text())
+            assert error_info["status_code"] == 200
+            assert "truncated" in error_info["error_message"].lower()
+
+    def test_request_flush_records_error_info_in_all_mode(self, tmp_path):
+        """
+        What it does: In "all" mode, request_flush()+discard_buffers() records
+            error_info.json (data is already written immediately in all mode).
+        Purpose: Verify the feature behaves consistently in both enabled modes.
+        """
+        debug_dir = tmp_path / "debug_logs"
+        with patch('kiro.debug_logger.DEBUG_MODE', 'all'):
+            # Arrange
+            dbg_logger = _make_logger(debug_dir)
+
+            # Act
+            dbg_logger.request_flush(reason="Tool call truncated by Kiro API", status_code=200)
+            dbg_logger.discard_buffers()
+
+            # Assert
+            assert (debug_dir / "error_info.json").exists()
+            error_info = json.loads((debug_dir / "error_info.json").read_text())
+            assert error_info["status_code"] == 200
+
+    def test_request_flush_is_noop_in_off_mode(self, tmp_path):
+        """
+        What it does: request_flush() does nothing when DEBUG_MODE=off, and
+            discard_buffers() writes no files.
+        Purpose: Disabled logging must never touch the filesystem.
+        """
+        debug_dir = tmp_path / "debug_logs"
+        with patch('kiro.debug_logger.DEBUG_MODE', 'off'):
+            # Arrange
+            dbg_logger = _make_logger(debug_dir)
+            dbg_logger.log_raw_chunk(b'chunk')
+
+            # Act
+            dbg_logger.request_flush(reason="truncation", status_code=200)
+            dbg_logger.discard_buffers()
+
+            # Assert
+            assert dbg_logger._flush_requested is False
+            assert not debug_dir.exists()
+
+    def test_discard_without_request_flush_does_not_write(self, tmp_path):
+        """
+        What it does: Without request_flush(), discard_buffers() keeps the
+            original "drop on success" behaviour in "errors" mode.
+        Purpose: Regression guard - normal successful requests must not start
+            leaving debug artifacts behind.
+        """
+        debug_dir = tmp_path / "debug_logs"
+        with patch('kiro.debug_logger.DEBUG_MODE', 'errors'):
+            # Arrange
+            dbg_logger = _make_logger(debug_dir)
+            dbg_logger.log_raw_chunk(b'chunk')
+
+            # Act
+            dbg_logger.discard_buffers()
+
+            # Assert
+            assert not debug_dir.exists()
+            assert len(dbg_logger._raw_chunks_buffer) == 0
+
+    def test_request_flush_is_idempotent_first_reason_wins(self, tmp_path):
+        """
+        What it does: Multiple request_flush() calls keep the first reason and
+            status (e.g. several truncated tools in one response).
+        Purpose: The earliest detected cause is the most useful; later calls
+            must not overwrite it.
+        """
+        debug_dir = tmp_path / "debug_logs"
+        with patch('kiro.debug_logger.DEBUG_MODE', 'errors'):
+            # Arrange
+            dbg_logger = _make_logger(debug_dir)
+            dbg_logger.log_raw_chunk(b'chunk')
+
+            # Act
+            dbg_logger.request_flush(reason="first cause", status_code=200)
+            dbg_logger.request_flush(reason="second cause", status_code=500)
+            dbg_logger.discard_buffers()
+
+            # Assert
+            error_info = json.loads((debug_dir / "error_info.json").read_text())
+            assert error_info["status_code"] == 200
+            assert error_info["error_message"] == "first cause"
+
+    def test_prepare_new_request_resets_flush_flag(self, tmp_path):
+        """
+        What it does: prepare_new_request() clears a leftover flush request so a
+            truncation in request N never forces a flush in request N+1.
+        Purpose: Prevent cross-request state bleed on the shared singleton.
+        """
+        debug_dir = tmp_path / "debug_logs"
+        with patch('kiro.debug_logger.DEBUG_MODE', 'errors'):
+            # Arrange
+            dbg_logger = _make_logger(debug_dir)
+            dbg_logger.request_flush(reason="stale truncation", status_code=200)
+            assert dbg_logger._flush_requested is True
+
+            # Act
+            dbg_logger.prepare_new_request()
+            dbg_logger.log_raw_chunk(b'fresh chunk')
+            dbg_logger.discard_buffers()
+
+            # Assert
+            assert dbg_logger._flush_requested is False
+            assert not debug_dir.exists()
+
+    def test_real_error_still_flushes_when_flag_set(self, tmp_path):
+        """
+        What it does: A genuine flush_on_error() (e.g. HTTP 500) still works when
+            a truncation flush was also requested, and the explicit error status
+            is preserved.
+        Purpose: A real upstream error must not be masked by the truncation flag.
+        """
+        debug_dir = tmp_path / "debug_logs"
+        with patch('kiro.debug_logger.DEBUG_MODE', 'errors'):
+            # Arrange
+            dbg_logger = _make_logger(debug_dir)
+            dbg_logger.log_raw_chunk(b'partial chunk')
+            dbg_logger.request_flush(reason="truncation", status_code=200)
+
+            # Act - route hits a real error and calls flush_on_error directly
+            dbg_logger.flush_on_error(500, "Upstream failure")
+
+            # Assert
+            error_info = json.loads((debug_dir / "error_info.json").read_text())
+            assert error_info["status_code"] == 500
+            assert error_info["error_message"] == "Upstream failure"
+            assert dbg_logger._flush_requested is False

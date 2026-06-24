@@ -6,6 +6,8 @@ Tests the parsing logic for AWS SSE stream from Kiro API.
 """
 
 import pytest
+import sys
+from unittest.mock import patch, MagicMock
 
 from kiro.parsers import (
     AwsEventStreamParser,
@@ -1357,3 +1359,111 @@ class TestTruncationRecoveryIntegration:
         
         print("Checking: Third tool call NOT marked as truncated...")
         assert aws_event_parser.tool_calls[2].get("_truncation_detected") is not True
+
+
+
+class TestAwsEventStreamParserTruncationDebugFlush:
+    """
+    Tests that tool-call truncation detection in _finalize_tool_call requests a
+    forced debug-stream capture (debug_logger.request_flush). This is the single
+    shared detection source, so it covers OpenAI/Anthropic and streaming/
+    non-streaming alike.
+    """
+
+    def test_truncated_tool_call_requests_debug_flush(self, aws_event_parser):
+        """
+        What it does: A truncated Write tool call (incomplete JSON) triggers
+            debug_logger.request_flush with status_code=200 and a descriptive
+            reason.
+        Purpose: Tool-call truncation returns HTTP 200, so the raw stream must
+            be force-captured for diagnosis instead of silently discarded.
+        """
+        # Arrange - 63 bytes, starts with { but no closing brace (real shape)
+        truncated_args = '{"file_path": "/home/mi/work/my_project/kiro-gateway/kiro/par'
+        aws_event_parser.current_tool_call = {
+            "id": "tooluse_abc123",
+            "type": "function",
+            "function": {"name": "Write", "arguments": truncated_args},
+        }
+        mock_debug_logger = MagicMock()
+
+        # Act
+        with patch('kiro.debug_logger.debug_logger', mock_debug_logger):
+            aws_event_parser._finalize_tool_call()
+
+        # Assert
+        mock_debug_logger.request_flush.assert_called_once()
+        _, kwargs = mock_debug_logger.request_flush.call_args
+        assert kwargs["status_code"] == 200
+        assert "Write" in kwargs["reason"]
+        assert "tooluse_abc123" in kwargs["reason"]
+        assert "truncated" in kwargs["reason"].lower()
+
+    def test_complete_tool_call_does_not_request_debug_flush(self, aws_event_parser):
+        """
+        What it does: A well-formed tool call does NOT trigger request_flush.
+        Purpose: Successful tool calls must never force debug capture.
+        """
+        # Arrange
+        aws_event_parser.current_tool_call = {
+            "id": "tooluse_ok",
+            "type": "function",
+            "function": {"name": "Write", "arguments": '{"file_path": "/tmp/a.txt", "content": "hi"}'},
+        }
+        mock_debug_logger = MagicMock()
+
+        # Act
+        with patch('kiro.debug_logger.debug_logger', mock_debug_logger):
+            aws_event_parser._finalize_tool_call()
+
+        # Assert
+        mock_debug_logger.request_flush.assert_not_called()
+
+    def test_truncation_debug_flush_independent_of_recovery_flag(self, aws_event_parser):
+        """
+        What it does: request_flush is called even when TRUNCATION_RECOVERY is
+            disabled.
+        Purpose: Debug capture must not depend on the recovery feature - users
+            troubleshooting truncation may have recovery off.
+        """
+        # Arrange
+        aws_event_parser.current_tool_call = {
+            "id": "tooluse_xyz",
+            "type": "function",
+            "function": {"name": "Write", "arguments": '{"file_path": "/x'},
+        }
+        mock_debug_logger = MagicMock()
+
+        # Act
+        with patch('kiro.config.TRUNCATION_RECOVERY', False):
+            with patch('kiro.debug_logger.debug_logger', mock_debug_logger):
+                aws_event_parser._finalize_tool_call()
+
+        # Assert
+        mock_debug_logger.request_flush.assert_called_once()
+        assert aws_event_parser.tool_calls[0].get("_truncation_detected") is True
+
+    def test_truncation_debug_import_failure_is_tolerated(self, aws_event_parser):
+        """
+        What it does: If kiro.debug_logger cannot be imported, _finalize_tool_call
+            still completes and normalises the truncated args to "{}".
+        Purpose: Debug capture is best-effort; an unavailable debug_logger must
+            never break the response pipeline (exercises the except ImportError
+            branch at the call site).
+        """
+        # Arrange
+        aws_event_parser.current_tool_call = {
+            "id": "tooluse_boom",
+            "type": "function",
+            "function": {"name": "Write", "arguments": '{"file_path": "/x'},
+        }
+
+        # Act - force `from kiro.debug_logger import debug_logger` to raise
+        # ImportError by poisoning the module entry in sys.modules.
+        with patch.dict(sys.modules, {'kiro.debug_logger': None}):
+            aws_event_parser._finalize_tool_call()
+
+        # Assert - parsing completed gracefully despite the import failure
+        assert len(aws_event_parser.tool_calls) == 1
+        assert aws_event_parser.tool_calls[0]["function"]["arguments"] == "{}"
+        assert aws_event_parser.tool_calls[0].get("_truncation_detected") is True

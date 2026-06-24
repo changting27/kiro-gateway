@@ -74,6 +74,15 @@ class DebugLogger:
         # Buffer for application logs (loguru)
         self._app_logs_buffer: io.StringIO = io.StringIO()
         self._loguru_sink_id: Optional[int] = None
+
+        # Forced-flush request state.
+        # Set via request_flush() when a non-HTTP-error condition (most
+        # importantly Kiro tool-call truncation on an otherwise HTTP 200
+        # response) wants its buffered artifacts persisted instead of
+        # discarded. Consumed by discard_buffers() at request finalization.
+        self._flush_requested: bool = False
+        self._flush_status: int = 200
+        self._flush_reason: str = ""
     
     def _is_enabled(self) -> bool:
         """Checks if logging is enabled."""
@@ -90,6 +99,13 @@ class DebugLogger:
         self._raw_chunks_buffer.clear()
         self._modified_chunks_buffer.clear()
         self._clear_app_logs_buffer()
+        self._reset_flush_request()
+    
+    def _reset_flush_request(self):
+        """Resets the forced-flush request flag to its default state."""
+        self._flush_requested = False
+        self._flush_status = 200
+        self._flush_reason = ""
     
     def _clear_app_logs_buffer(self):
         """Clears the application logs buffer and removes sink."""
@@ -315,13 +331,58 @@ class DebugLogger:
             # Clear buffers after flush
             self._clear_buffers()
     
+    def request_flush(self, reason: str, status_code: int = 200) -> None:
+        """
+        Request that buffered debug artifacts be persisted even though the
+        request will complete with a non-error HTTP status.
+
+        This hook exists for fault conditions that are invisible to the HTTP
+        envelope but are nonetheless worth capturing for diagnosis - most
+        importantly Kiro API tool-call truncation, which is detected mid-stream
+        yet still returns HTTP 200 to the client. Without it, DEBUG_MODE="errors"
+        would discard the raw stream on success and the truncation could never
+        be inspected after the fact.
+
+        The flag is consumed by discard_buffers() at request finalization, which
+        flushes instead of discarding. It is idempotent: the first reason wins so
+        the earliest detected cause is preserved across multiple truncated tools
+        in one response. It is a no-op when logging is disabled (DEBUG_MODE=off).
+
+        Args:
+            reason: Human-readable explanation stored in error_info.json.
+            status_code: Status code recorded alongside the reason (default 200,
+                signalling the client envelope was not itself an HTTP error).
+        """
+        if not self._is_enabled():
+            return
+        if self._flush_requested:
+            # Preserve the first detected cause; ignore later requests.
+            return
+        self._flush_requested = True
+        self._flush_status = status_code
+        self._flush_reason = reason
+        logger.debug(f"[DebugLogger] Forced flush requested (status={status_code}): {reason}")
+
     def discard_buffers(self):
         """
         Clears buffers without writing to files.
         
         Called when request completed successfully in "errors" mode.
         Also called in "all" mode to save logs of successful request.
+        
+        Exception: if request_flush() was called during this request (e.g. a
+        Kiro tool-call truncation was detected on an otherwise HTTP 200
+        response), the buffered artifacts are flushed to disk instead of being
+        discarded, so the raw stream remains available for diagnosis.
         """
+        # A forced-flush request overrides the normal discard-on-success path.
+        # flush_on_error performs exactly the right file operations in both
+        # "errors" (flush buffers) and "all" (write error_info + app logs) modes.
+        if self._flush_requested and self._is_enabled():
+            self.flush_on_error(self._flush_status, self._flush_reason)
+            self._reset_flush_request()
+            return
+
         if DEBUG_MODE == "errors":
             self._clear_buffers()
         elif DEBUG_MODE == "all":

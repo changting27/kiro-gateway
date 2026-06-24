@@ -439,6 +439,28 @@ class AwsEventStreamParser:
                             f"This is a Kiro API limitation. "
                             f"{'Model will be notified automatically about truncation.' if TRUNCATION_RECOVERY else 'Set TRUNCATION_RECOVERY=true in .env to auto-notify model about truncation.'}"
                         )
+
+                        # Force-capture the raw upstream stream for diagnosis.
+                        # Tool-call truncation is invisible to the HTTP envelope
+                        # (the response still completes with 200), so without this
+                        # DEBUG_MODE="errors" would discard the evidence on success.
+                        # Runs independently of TRUNCATION_RECOVERY and self-gates
+                        # on DEBUG_MODE inside request_flush(). This is the single
+                        # detection source shared by streaming and non-streaming and
+                        # by both the OpenAI and Anthropic paths.
+                        try:
+                            from kiro.debug_logger import debug_logger
+                            debug_logger.request_flush(
+                                reason=(
+                                    f"Tool call truncated by Kiro API: tool='{tool_name}', "
+                                    f"id={tool_id}, size={truncation_info['size_bytes']} bytes, "
+                                    f"reason={truncation_info['reason']}"
+                                ),
+                                status_code=200,
+                            )
+                        except ImportError:
+                            # debug_logger unavailable; truncation handling proceeds.
+                            pass
                     else:
                         # Regular JSON parse error
                         logger.warning(f"Failed to parse tool '{tool_name}' arguments: {e}. Raw: {args[:200]}")
