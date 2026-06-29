@@ -1274,6 +1274,165 @@ class TestAccountManagerGetAllAvailableModels:
         assert all(isinstance(m, str) for m in models)
 
 
+class TestAccountManagerGetModelMaxInputTokens:
+    """
+    Tests for AccountManager.get_model_max_input_tokens() method.
+    
+    This aggregator backs the /v1/models endpoint's context-window advertisement.
+    Accounts are injected directly with populated ModelInfoCache instances so the
+    aggregation logic is exercised in isolation (no network, no lazy init).
+    """
+    
+    def _make_manager(self, tmp_path) -> AccountManager:
+        """Build a bare AccountManager whose _accounts is populated by the test."""
+        return AccountManager(
+            credentials_file=str(tmp_path / "credentials.json"),
+            state_file=str(tmp_path / "state.json"),
+        )
+    
+    @pytest.mark.asyncio
+    async def test_returns_limit_for_model_present_single_account(self, tmp_path):
+        """
+        What it does: Returns the model's real limit from a single account's cache.
+        Purpose: Baseline - the advertised window equals Kiro's maxInputTokens.
+        """
+        print("\n=== Test: single account, model present ===")
+        cache = ModelInfoCache()
+        await cache.update([
+            {"modelId": "claude-opus-4.5", "tokenLimits": {"maxInputTokens": 200000}}
+        ])
+        manager = self._make_manager(tmp_path)
+        manager._accounts = {"acc1": Account(id="acc1", model_cache=cache)}
+        
+        result = manager.get_model_max_input_tokens("claude-opus-4.5")
+        
+        print(f"Comparing: Expected 200000, Got {result}")
+        assert result == 200000
+    
+    @pytest.mark.asyncio
+    async def test_returns_default_when_model_absent_everywhere(self, tmp_path):
+        """
+        What it does: Falls back to DEFAULT_MAX_INPUT_TOKENS for an unknown model.
+        Purpose: Ensure the endpoint never advertises a null/zero window for a model
+                 that no initialized account knows about.
+        """
+        print("\n=== Test: model absent in all caches -> default ===")
+        from kiro.config import DEFAULT_MAX_INPUT_TOKENS
+        
+        cache = ModelInfoCache()
+        await cache.update([
+            {"modelId": "claude-opus-4.5", "tokenLimits": {"maxInputTokens": 200000}}
+        ])
+        manager = self._make_manager(tmp_path)
+        manager._accounts = {"acc1": Account(id="acc1", model_cache=cache)}
+        
+        result = manager.get_model_max_input_tokens("model-that-does-not-exist")
+        
+        print(f"Comparing: Expected {DEFAULT_MAX_INPUT_TOKENS}, Got {result}")
+        assert result == DEFAULT_MAX_INPUT_TOKENS
+    
+    @pytest.mark.asyncio
+    async def test_returns_max_across_accounts(self, tmp_path):
+        """
+        What it does: Returns the LARGEST limit when accounts disagree for a model.
+        Purpose: A model available on a higher-tier account must not be advertised
+                 with a smaller window than that account can actually serve.
+        """
+        print("\n=== Test: multiple accounts -> max limit wins ===")
+        cache_small = ModelInfoCache()
+        await cache_small.update([
+            {"modelId": "claude-opus-4.5", "tokenLimits": {"maxInputTokens": 200000}}
+        ])
+        cache_large = ModelInfoCache()
+        await cache_large.update([
+            {"modelId": "claude-opus-4.5", "tokenLimits": {"maxInputTokens": 1000000}}
+        ])
+        manager = self._make_manager(tmp_path)
+        manager._accounts = {
+            "acc_small": Account(id="acc_small", model_cache=cache_small),
+            "acc_large": Account(id="acc_large", model_cache=cache_large),
+        }
+        
+        result = manager.get_model_max_input_tokens("claude-opus-4.5")
+        
+        print(f"Comparing: Expected 1000000 (max), Got {result}")
+        assert result == 1000000
+    
+    @pytest.mark.asyncio
+    async def test_skips_uninitialized_account_with_none_cache(self, tmp_path):
+        """
+        What it does: Ignores accounts whose model_cache is None (not yet lazily
+                      initialized) and still returns the limit from a ready account.
+        Purpose: Lazy init means some accounts have no cache yet - the aggregator
+                 must not crash on None and must still find the real limit.
+        """
+        print("\n=== Test: uninitialized (None cache) account is skipped ===")
+        cache = ModelInfoCache()
+        await cache.update([
+            {"modelId": "claude-haiku-4.5", "tokenLimits": {"maxInputTokens": 100000}}
+        ])
+        manager = self._make_manager(tmp_path)
+        manager._accounts = {
+            "uninit": Account(id="uninit", model_cache=None),
+            "ready": Account(id="ready", model_cache=cache),
+        }
+        
+        result = manager.get_model_max_input_tokens("claude-haiku-4.5")
+        
+        print(f"Comparing: Expected 100000, Got {result}")
+        assert result == 100000
+    
+    @pytest.mark.asyncio
+    async def test_ignores_cache_that_lacks_the_model(self, tmp_path):
+        """
+        What it does: A cache that does NOT contain the model is skipped entirely,
+                      so its default-floor never inflates the result.
+        Purpose: Critical correctness guard - get_max_input_tokens() returns the
+                 default for unknown models, so the aggregator must gate on
+                 is_valid_model() to avoid reporting a default that is LARGER than
+                 the real limit from the account that actually has the model.
+        """
+        print("\n=== Test: cache lacking the model is gated out ===")
+        # Account A genuinely has the model with a SMALL window (below the default).
+        cache_has = ModelInfoCache()
+        await cache_has.update([
+            {"modelId": "tiny-model", "tokenLimits": {"maxInputTokens": 150000}}
+        ])
+        # Account B does NOT have the model; its get_max_input_tokens would return the
+        # 200000 default, which must NOT leak into the result.
+        cache_lacks = ModelInfoCache()
+        await cache_lacks.update([
+            {"modelId": "other-model", "tokenLimits": {"maxInputTokens": 200000}}
+        ])
+        manager = self._make_manager(tmp_path)
+        manager._accounts = {
+            "has": Account(id="has", model_cache=cache_has),
+            "lacks": Account(id="lacks", model_cache=cache_lacks),
+        }
+        
+        result = manager.get_model_max_input_tokens("tiny-model")
+        
+        print(f"Comparing: Expected 150000 (default-floor of 'lacks' must be ignored), "
+              f"Got {result}")
+        assert result == 150000
+    
+    def test_returns_default_when_no_accounts(self, tmp_path):
+        """
+        What it does: Returns DEFAULT_MAX_INPUT_TOKENS when there are no accounts.
+        Purpose: Defensive - an empty account map must not raise.
+        """
+        print("\n=== Test: no accounts -> default ===")
+        from kiro.config import DEFAULT_MAX_INPUT_TOKENS
+        
+        manager = self._make_manager(tmp_path)
+        manager._accounts = {}
+        
+        result = manager.get_model_max_input_tokens("claude-opus-4.5")
+        
+        print(f"Comparing: Expected {DEFAULT_MAX_INPUT_TOKENS}, Got {result}")
+        assert result == DEFAULT_MAX_INPUT_TOKENS
+
+
 class TestFormatDuration:
     """
     Tests for _format_duration() helper function.

@@ -126,6 +126,127 @@ class TestOpenAIModel:
         
         print(f"Comparing description: Expected None, Got {model.description}")
         assert model.description is None
+    
+    def test_max_input_tokens_defaults_to_none(self):
+        """
+        What it does: Verifies that max_input_tokens defaults to None when omitted.
+        Purpose: Ensure the new context-window field is optional and backward
+                 compatible (clients/callers that don't set it still work).
+        """
+        print("Setup: Creating OpenAIModel without max_input_tokens...")
+        model = OpenAIModel(id="test-model")
+        
+        print(f"Comparing max_input_tokens: Expected None, Got {model.max_input_tokens}")
+        assert model.max_input_tokens is None
+    
+    def test_context_length_defaults_to_none(self):
+        """
+        What it does: Verifies that context_length defaults to None when omitted.
+        Purpose: Ensure the OpenRouter-style alias field is optional and backward
+                 compatible.
+        """
+        print("Setup: Creating OpenAIModel without context_length...")
+        model = OpenAIModel(id="test-model")
+        
+        print(f"Comparing context_length: Expected None, Got {model.context_length}")
+        assert model.context_length is None
+    
+    def test_accepts_max_input_tokens(self):
+        """
+        What it does: Verifies max_input_tokens is stored when provided.
+        Purpose: Ensure Kiro's real maxInputTokens can be advertised to clients.
+        """
+        print("Setup: Creating OpenAIModel with max_input_tokens=200000...")
+        model = OpenAIModel(id="claude-opus-4.5", max_input_tokens=200000)
+        
+        print(f"Comparing max_input_tokens: Expected 200000, Got {model.max_input_tokens}")
+        assert model.max_input_tokens == 200000
+    
+    def test_accepts_context_length(self):
+        """
+        What it does: Verifies context_length is stored when provided.
+        Purpose: Ensure the OpenRouter-style alias carries the context window.
+        """
+        print("Setup: Creating OpenAIModel with context_length=200000...")
+        model = OpenAIModel(id="claude-opus-4.5", context_length=200000)
+        
+        print(f"Comparing context_length: Expected 200000, Got {model.context_length}")
+        assert model.context_length == 200000
+    
+    def test_accepts_both_context_window_fields_together(self):
+        """
+        What it does: Verifies both context-window fields can be set on one model
+                      and hold the same value (as the endpoint populates them).
+        Purpose: Mirror real usage where /v1/models sets both fields to Kiro's
+                 maxInputTokens so any client convention picks it up.
+        """
+        print("Setup: Creating OpenAIModel with both fields set to 100000...")
+        model = OpenAIModel(
+            id="claude-haiku-4.5",
+            max_input_tokens=100000,
+            context_length=100000,
+        )
+        
+        print(f"Comparing fields: max_input_tokens={model.max_input_tokens}, "
+              f"context_length={model.context_length}")
+        assert model.max_input_tokens == 100000
+        assert model.context_length == 100000
+        assert model.max_input_tokens == model.context_length
+    
+    def test_accepts_large_context_window(self):
+        """
+        What it does: Verifies a 1M-token context window is accepted.
+        Purpose: Ensure large limits (e.g. 1M beta windows) are representable and
+                 not silently clamped, so clients see the true upstream capacity.
+        """
+        print("Setup: Creating OpenAIModel with a 1,000,000-token window...")
+        model = OpenAIModel(
+            id="some-large-model",
+            max_input_tokens=1_000_000,
+            context_length=1_000_000,
+        )
+        
+        print(f"Comparing max_input_tokens: Expected 1000000, Got {model.max_input_tokens}")
+        assert model.max_input_tokens == 1_000_000
+        assert model.context_length == 1_000_000
+    
+    def test_context_window_fields_are_serialized(self):
+        """
+        What it does: Verifies the new fields appear in the serialized payload.
+        Purpose: Ensure clients actually receive max_input_tokens/context_length
+                 over the wire (model_dump is what FastAPI serializes).
+        """
+        print("Setup: Creating OpenAIModel and dumping to dict...")
+        model = OpenAIModel(
+            id="claude-sonnet-4.5",
+            max_input_tokens=200000,
+            context_length=200000,
+        )
+        dumped = model.model_dump()
+        
+        print(f"Serialized keys: {sorted(dumped.keys())}")
+        assert "max_input_tokens" in dumped
+        assert "context_length" in dumped
+        assert dumped["max_input_tokens"] == 200000
+        assert dumped["context_length"] == 200000
+    
+    def test_context_window_fields_serialized_as_none_when_unset(self):
+        """
+        What it does: Verifies unset context-window fields serialize as None.
+        Purpose: Guarantee the fields are always present in the payload (so a
+                 client can detect "unknown" via null) rather than being dropped.
+        """
+        print("Setup: Creating OpenAIModel without context-window fields...")
+        model = OpenAIModel(id="claude-sonnet-4.5")
+        dumped = model.model_dump()
+        
+        print(f"Serialized context-window fields: "
+              f"max_input_tokens={dumped.get('max_input_tokens')}, "
+              f"context_length={dumped.get('context_length')}")
+        assert "max_input_tokens" in dumped
+        assert "context_length" in dumped
+        assert dumped["max_input_tokens"] is None
+        assert dumped["context_length"] is None
 
 
 # ==================================================================================================

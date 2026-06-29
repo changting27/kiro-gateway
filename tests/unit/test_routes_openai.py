@@ -525,6 +525,45 @@ class TestModelsEndpoint:
         
         for model in response.json()["data"]:
             assert model["owned_by"] == "anthropic"
+    
+    def test_models_include_context_window_fields(self, test_client, valid_proxy_api_key):
+        """
+        What it does: Verifies every model advertises max_input_tokens and
+                      context_length as positive integers that agree with each other.
+        Purpose: This is the architecture-level fix - clients must be able to read
+                 each model's real Kiro context window from /v1/models so they can
+                 align their auto-compaction threshold. Both field-name conventions
+                 must be present, non-null, positive, and consistent.
+        """
+        print("Action: GET /v1/models with valid auth...")
+        response = test_client.get(
+            "/v1/models",
+            headers={"Authorization": f"Bearer {valid_proxy_api_key}"}
+        )
+        
+        print(f"Result: {response.json()}")
+        assert response.status_code == 200
+        
+        data = response.json()["data"]
+        assert len(data) >= 1, "Expected at least one model to validate"
+        
+        for model in data:
+            print(f"Checking context-window fields on {model['id']}: "
+                  f"max_input_tokens={model.get('max_input_tokens')}, "
+                  f"context_length={model.get('context_length')}")
+            # Both fields present in the serialized payload
+            assert "max_input_tokens" in model, "Model missing 'max_input_tokens' field"
+            assert "context_length" in model, "Model missing 'context_length' field"
+            # Populated (never null) so clients always get a usable window
+            assert model["max_input_tokens"] is not None
+            assert model["context_length"] is not None
+            # Positive integers
+            assert isinstance(model["max_input_tokens"], int)
+            assert isinstance(model["context_length"], int)
+            assert model["max_input_tokens"] > 0
+            assert model["context_length"] > 0
+            # Both conventions carry the same value
+            assert model["max_input_tokens"] == model["context_length"]
 
 
 # =============================================================================
@@ -1726,6 +1765,138 @@ class TestModelsEndpointAccountSystem:
         assert "claude-sonnet-4.5" in available_model_ids
         assert len(available_model_ids) == 2
         print("✅ Legacy mode correctly uses first account's resolver")
+    
+    @pytest.mark.asyncio
+    async def test_get_models_enriches_context_window_account_system(self):
+        """
+        What it does: Calls the real get_models() in account-system mode and verifies
+                      each returned OpenAIModel carries the per-model limit from
+                      account_manager.get_model_max_input_tokens().
+        Purpose: Prove the endpoint advertises Kiro's real context window per model
+                 (the architecture-level fix) in account-system mode.
+        """
+        print("\n--- Test: get_models enriches context window (account system) ---")
+        from types import SimpleNamespace
+        from kiro.routes_openai import get_models
+        
+        limits = {"claude-opus-4.5": 200000, "claude-haiku-4.5": 100000}
+        
+        mock_manager = Mock()
+        mock_manager.get_all_available_models.return_value = list(limits.keys())
+        mock_manager.get_model_max_input_tokens.side_effect = lambda model_id: limits[model_id]
+        
+        fake_request = SimpleNamespace(
+            app=SimpleNamespace(
+                state=SimpleNamespace(account_system=True, account_manager=mock_manager)
+            )
+        )
+        
+        print("Action: await get_models(fake_request)...")
+        result = await get_models(fake_request)
+        
+        by_id = {m.id: m for m in result.data}
+        print(f"Returned models: {[(m.id, m.max_input_tokens, m.context_length) for m in result.data]}")
+        
+        print("Checking: opus advertises 200000 on both fields...")
+        assert by_id["claude-opus-4.5"].max_input_tokens == 200000
+        assert by_id["claude-opus-4.5"].context_length == 200000
+        
+        print("Checking: haiku advertises 100000 on both fields...")
+        assert by_id["claude-haiku-4.5"].max_input_tokens == 100000
+        assert by_id["claude-haiku-4.5"].context_length == 100000
+        
+        print("Checking: per-model limit lookup was called once per model...")
+        assert mock_manager.get_model_max_input_tokens.call_count == 2
+        print("✅ Account-system mode correctly enriches context window")
+    
+    @pytest.mark.asyncio
+    async def test_get_models_enriches_context_window_legacy(self):
+        """
+        What it does: Calls the real get_models() in legacy mode and verifies each
+                      OpenAIModel carries the limit from the first account's
+                      model_cache.get_max_input_tokens().
+        Purpose: Prove the enrichment also works in legacy (single-account) mode -
+                 feature must not be account-system only.
+        """
+        print("\n--- Test: get_models enriches context window (legacy) ---")
+        from types import SimpleNamespace
+        from kiro.routes_openai import get_models
+        
+        limits = {"claude-opus-4.5": 200000, "claude-sonnet-4.5": 200000}
+        
+        mock_cache = Mock()
+        mock_cache.get_max_input_tokens.side_effect = lambda model_id: limits[model_id]
+        
+        mock_resolver = Mock()
+        mock_resolver.get_available_models.return_value = list(limits.keys())
+        
+        mock_account = Mock()
+        mock_account.model_resolver = mock_resolver
+        mock_account.model_cache = mock_cache
+        
+        mock_manager = Mock()
+        mock_manager.get_first_account.return_value = mock_account
+        
+        fake_request = SimpleNamespace(
+            app=SimpleNamespace(
+                state=SimpleNamespace(account_system=False, account_manager=mock_manager)
+            )
+        )
+        
+        print("Action: await get_models(fake_request)...")
+        result = await get_models(fake_request)
+        
+        by_id = {m.id: m for m in result.data}
+        print(f"Returned models: {[(m.id, m.max_input_tokens, m.context_length) for m in result.data]}")
+        
+        print("Checking: both models advertise 200000 on both fields...")
+        for model_id in limits:
+            assert by_id[model_id].max_input_tokens == 200000
+            assert by_id[model_id].context_length == 200000
+        
+        print("Checking: legacy lookup used the first account's cache per model...")
+        assert mock_cache.get_max_input_tokens.call_count == 2
+        print("✅ Legacy mode correctly enriches context window")
+    
+    @pytest.mark.asyncio
+    async def test_get_models_legacy_none_cache_falls_back_to_default(self):
+        """
+        What it does: In legacy mode, when the first account has no model_cache yet
+                      (None), get_models() advertises DEFAULT_MAX_INPUT_TOKENS instead
+                      of crashing.
+        Purpose: Defensive guard - the endpoint must never raise on a half-initialized
+                 account and must still return a usable, non-null window.
+        """
+        print("\n--- Test: get_models legacy None cache -> default ---")
+        from types import SimpleNamespace
+        from kiro.routes_openai import get_models
+        from kiro.config import DEFAULT_MAX_INPUT_TOKENS
+        
+        mock_resolver = Mock()
+        mock_resolver.get_available_models.return_value = ["claude-opus-4.5"]
+        
+        mock_account = Mock()
+        mock_account.model_resolver = mock_resolver
+        mock_account.model_cache = None  # not yet initialized
+        
+        mock_manager = Mock()
+        mock_manager.get_first_account.return_value = mock_account
+        
+        fake_request = SimpleNamespace(
+            app=SimpleNamespace(
+                state=SimpleNamespace(account_system=False, account_manager=mock_manager)
+            )
+        )
+        
+        print("Action: await get_models(fake_request)...")
+        result = await get_models(fake_request)
+        
+        model = result.data[0]
+        print(f"Comparing: Expected {DEFAULT_MAX_INPUT_TOKENS} on both fields, "
+              f"Got max_input_tokens={model.max_input_tokens}, context_length={model.context_length}")
+        assert model.max_input_tokens == DEFAULT_MAX_INPUT_TOKENS
+        assert model.context_length == DEFAULT_MAX_INPUT_TOKENS
+        print("✅ Legacy None-cache correctly falls back to default window")
 
 
 # ==================================================================================================

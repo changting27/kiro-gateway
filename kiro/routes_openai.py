@@ -40,6 +40,7 @@ from kiro.config import (
     APP_VERSION,
     PROFILE_ARN,
     HEALTH_CHECK_METHODS,
+    DEFAULT_MAX_INPUT_TOKENS,
 )
 from kiro.models_openai import (
     OpenAIModel,
@@ -134,37 +135,71 @@ async def health():
 @router.get("/v1/models", response_model=ModelList, dependencies=[Depends(verify_api_key)])
 async def get_models(request: Request):
     """
-    Return list of available models.
+    Return list of available models, enriched with each model's real context window.
     
-    Models are loaded at startup (blocking) and cached.
-    This endpoint returns the cached list.
+    Models are loaded at startup (blocking) and cached. This endpoint returns the
+    cached list. Every model is annotated with Kiro's real ``maxInputTokens`` (exposed
+    as both ``max_input_tokens`` and ``context_length`` on each OpenAIModel) so that
+    OpenAI-compatible clients can align their auto-compaction threshold with the true
+    upstream limit instead of a hardcoded assumption.
+    
+    Feature-consistency note (AGENTS.md section 10): ``/v1/models`` is a single shared
+    GET endpoint. The real OpenAI and Anthropic APIs both expose model listings at this
+    same path, so this one handler serves clients of both surfaces - there is no
+    separate Anthropic models endpoint to keep in sync. Being a GET listing, it has no
+    streaming variant. The Anthropic ``count_tokens`` endpoint is intentionally left
+    untouched: it returns only ``input_tokens`` per the Anthropic schema, and the model
+    listing is the correct, schema-compatible place to advertise context windows.
     
     Args:
         request: FastAPI Request for accessing app.state
     
     Returns:
-        ModelList with available models in consistent format (with dots)
+        ModelList with available models in consistent format (with dots), each carrying
+        its real context-window size.
     """
     logger.info("Request to /v1/models")
     
-    # Get available models based on mode
+    # Resolve the available model IDs and a per-model context-window lookup that works
+    # for whichever mode the gateway runs in. The lookup always returns a concrete int
+    # (falling back to DEFAULT_MAX_INPUT_TOKENS) so the advertised window is never null.
     if request.app.state.account_system:
-        # Account system: collect models from all initialized accounts
-        available_model_ids = request.app.state.account_manager.get_all_available_models()
+        # Account system: collect models from all initialized accounts and aggregate
+        # each model's limit across every account that provides it.
+        account_manager = request.app.state.account_manager
+        available_model_ids = account_manager.get_all_available_models()
+        
+        def get_model_limit(model_id: str) -> int:
+            return account_manager.get_model_max_input_tokens(model_id)
     else:
-        # Legacy: use resolver from first account
+        # Legacy: use resolver and cache from the first initialized account.
         account = request.app.state.account_manager.get_first_account()
         available_model_ids = account.model_resolver.get_available_models()
+        model_cache = account.model_cache
+        
+        def get_model_limit(model_id: str) -> int:
+            if model_cache is None:
+                return DEFAULT_MAX_INPUT_TOKENS
+            return model_cache.get_max_input_tokens(model_id)
     
-    # Build OpenAI-compatible model list
-    openai_models = [
-        OpenAIModel(
-            id=model_id,
-            owned_by="anthropic",
-            description="Claude model via Kiro API"
+    # Build OpenAI-compatible model list, advertising the real context window per model.
+    openai_models = []
+    for model_id in available_model_ids:
+        max_input_tokens = get_model_limit(model_id)
+        openai_models.append(
+            OpenAIModel(
+                id=model_id,
+                owned_by="anthropic",
+                description="Claude model via Kiro API",
+                max_input_tokens=max_input_tokens,
+                context_length=max_input_tokens,
+            )
         )
-        for model_id in available_model_ids
-    ]
+    
+    logger.debug(
+        f"Returning {len(openai_models)} models with context-window metadata "
+        f"(account_system={request.app.state.account_system})"
+    )
     
     return ModelList(data=openai_models)
 

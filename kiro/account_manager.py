@@ -58,6 +58,7 @@ from kiro.config import (
     ACCOUNT_CACHE_TTL,
     STATE_SAVE_INTERVAL_SECONDS,
     FALLBACK_MODELS,
+    DEFAULT_MAX_INPUT_TOKENS,
 )
 from kiro.utils import get_kiro_headers
 from kiro.account_errors import ErrorType
@@ -895,3 +896,34 @@ class AccountManager:
             if account.model_resolver:
                 all_models.update(account.model_resolver.get_available_models())
         return sorted(all_models)
+    
+    def get_model_max_input_tokens(self, model_id: str) -> int:
+        """
+        Return the maximum input-token limit for a model across all initialized accounts.
+        
+        Used by the /v1/models endpoint to advertise each model's real Kiro context
+        window. Only caches that actually contain the model are consulted (via
+        ``is_valid_model``), so accounts that merely fall back to the default for an
+        absent model do not skew the result. When several accounts expose the same
+        model with different limits (e.g. different subscription tiers), the largest
+        limit is returned so the advertised window is never smaller than what at least
+        one account can genuinely serve.
+        
+        Args:
+            model_id: Model ID in display form, as returned by get_all_available_models()
+        
+        Returns:
+            Maximum input-token limit in tokens, or DEFAULT_MAX_INPUT_TOKENS when the
+            model is not present in any initialized account's cache.
+        """
+        best: Optional[int] = None
+        for account in self._accounts.values():
+            cache = account.model_cache
+            if cache is not None and cache.is_valid_model(model_id):
+                value = cache.get_max_input_tokens(model_id)
+                if best is None or value > best:
+                    best = value
+        
+        if best is None:
+            return DEFAULT_MAX_INPUT_TOKENS
+        return best

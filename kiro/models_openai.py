@@ -39,12 +39,39 @@ class OpenAIModel(BaseModel):
     Data model for describing an AI model in OpenAI format.
     
     Used in the /v1/models endpoint response.
+    
+    Beyond the standard OpenAI fields, this model also advertises the model's real
+    upstream context-window size (Kiro's ``tokenLimits.maxInputTokens``). OpenAI-style
+    ``/v1/models`` responses have no official context-window field, so two widely-used
+    community conventions are exposed with the same value:
+    
+    - ``max_input_tokens``: LiteLLM / transparent mirror of Kiro's own field name.
+    - ``context_length``: OpenRouter convention adopted by many OpenAI-compatible tools.
+    
+    Clients that read either field can align their auto-compaction threshold with the
+    model's true Kiro limit instead of a hardcoded assumption (which otherwise leads to
+    "Model context limit reached" 400s when the assumed window exceeds Kiro's). Clients
+    that ignore these fields are unaffected - the original OpenAI schema is preserved.
+    
+    Attributes:
+        id: Model identifier (display form, e.g. "claude-opus-4.5").
+        object: OpenAI object type, always "model".
+        created: Creation timestamp (auto-generated).
+        owned_by: Model owner, defaults to "anthropic".
+        description: Optional human-readable description.
+        max_input_tokens: Real maximum input-token limit reported by Kiro, or None
+            when unknown.
+        context_length: Same value as ``max_input_tokens``, exposed under the
+            OpenRouter-style field name for broader client compatibility, or None
+            when unknown.
     """
     id: str
     object: str = "model"
     created: int = Field(default_factory=lambda: int(time.time()))
     owned_by: str = "anthropic"
     description: Optional[str] = None
+    max_input_tokens: Optional[int] = None
+    context_length: Optional[int] = None
 
 
 class ModelList(BaseModel):
