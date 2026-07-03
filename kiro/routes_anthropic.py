@@ -58,12 +58,55 @@ from kiro.utils import generate_conversation_id
 from kiro.tokenizer import estimate_request_tokens
 from kiro.config import WEB_SEARCH_ENABLED
 from kiro.mcp_tools import handle_native_web_search
+from kiro.kiro_errors import enhance_kiro_error, build_anthropic_error_body
 
 # Import debug_logger
 try:
     from kiro.debug_logger import debug_logger
 except ImportError:
     debug_logger = None
+
+
+def _estimate_anthropic_input_tokens(request_data) -> Optional[int]:
+    """
+    Best-effort input-token estimate for the context-overflow error message.
+
+    Mirrors the /v1/messages/count_tokens estimation so the numbers reported in
+    the canonical overflow error are realistic. This is strictly cosmetic — the
+    error builder clamps to a self-consistent value when this returns None — so
+    any estimation failure is swallowed rather than masking the real API error.
+
+    Args:
+        request_data: The incoming AnthropicMessagesRequest.
+
+    Returns:
+        Estimated total input tokens, or None if estimation failed.
+    """
+    try:
+        messages_for_tokenizer = [msg.model_dump() for msg in request_data.messages]
+        tools_for_tokenizer = (
+            [tool.model_dump() for tool in request_data.tools]
+            if request_data.tools else None
+        )
+        if isinstance(request_data.system, list):
+            system_for_tokenizer = [
+                b.model_dump() if hasattr(b, "model_dump") else b
+                for b in request_data.system
+            ]
+        else:
+            system_for_tokenizer = request_data.system
+        stats = estimate_request_tokens(
+            messages=messages_for_tokenizer,
+            tools=tools_for_tokenizer,
+            system_prompt=system_for_tokenizer,
+            apply_claude_correction=True,
+        )
+        return stats["total_tokens"]
+    except Exception as exc:  # best-effort estimate; must never mask the real error
+        logger.debug(
+            f"Anthropic input-token estimate failed, using clamp fallback: {exc}"
+        )
+        return None
 
 
 # --- Security scheme ---
@@ -546,19 +589,18 @@ async def messages(
                     await http_client.close()
                     error_text = error_content.decode('utf-8', errors='replace')
                     
-                    # Extract error reason and save for final return
-                    error_reason = None
+                    # Extract error reason and save for final return.
+                    # Run non-JSON bodies through the enhancer too, so the
+                    # text-based context-overflow fallback can still fire.
                     try:
                         error_json = json.loads(error_text)
-                        from kiro.kiro_errors import enhance_kiro_error
                         error_info = enhance_kiro_error(error_json)
-                        error_reason = error_info.reason
-                        last_error_message = error_info.user_message
-                        last_error_status = response.status_code
-                        logger.debug(f"Original Kiro error: {error_info.original_message} (reason: {error_info.reason})")
                     except (json.JSONDecodeError, KeyError):
-                        last_error_message = error_text
-                        last_error_status = response.status_code
+                        error_info = enhance_kiro_error({"message": error_text})
+                    error_reason = error_info.reason
+                    last_error_message = error_info.user_message
+                    last_error_status = response.status_code
+                    logger.debug(f"Original Kiro error: {error_info.original_message} (reason: {error_info.reason})")
                     
                     # Classify error
                     error_type = classify_error(response.status_code, error_reason)
@@ -575,15 +617,18 @@ async def messages(
                         if debug_logger:
                             debug_logger.flush_on_error(response.status_code, last_error_message)
                         
+                        # Context-overflow is re-shaped into the canonical Anthropic
+                        # invalid_request_error so Claude Code auto-compacts + retries.
+                        overflow_status, error_body = build_anthropic_error_body(
+                            error_info,
+                            response.status_code,
+                            context_limit=account_manager.get_model_max_input_tokens(request_data.model),
+                            max_tokens=request_data.max_tokens or 0,
+                            estimated_input_tokens=_estimate_anthropic_input_tokens(request_data),
+                        )
                         return JSONResponse(
-                            status_code=response.status_code,
-                            content={
-                                "type": "error",
-                                "error": {
-                                    "type": "api_error",
-                                    "message": last_error_message
-                                }
-                            }
+                            status_code=overflow_status,
+                            content=error_body,
                         )
                     
                     else:  # ErrorType.RECOVERABLE
@@ -780,18 +825,15 @@ async def messages(
             await http_client.close()
             error_text = error_content.decode('utf-8', errors='replace')
             
-            # Try to parse JSON response from Kiro to extract error message
-            error_message = error_text
+            # Parse Kiro's error; run non-JSON bodies through the enhancer too so
+            # the text-based context-overflow fallback can still fire.
             try:
                 error_json = json.loads(error_text)
-                # Enhance Kiro API errors with user-friendly messages
-                from kiro.kiro_errors import enhance_kiro_error
                 error_info = enhance_kiro_error(error_json)
-                error_message = error_info.user_message
-                # Log original error for debugging
-                logger.debug(f"Original Kiro error: {error_info.original_message} (reason: {error_info.reason})")
             except (json.JSONDecodeError, KeyError):
-                pass
+                error_info = enhance_kiro_error({"message": error_text})
+            error_message = error_info.user_message
+            logger.debug(f"Original Kiro error: {error_info.original_message} (reason: {error_info.reason})")
             
             # Log access log for error (before flush, so it gets into app_logs)
             logger.warning(
@@ -802,16 +844,18 @@ async def messages(
             if debug_logger:
                 debug_logger.flush_on_error(response.status_code, error_message)
             
-            # Return error in Anthropic format
+            # Context-overflow is re-shaped into the canonical Anthropic
+            # invalid_request_error so Claude Code auto-compacts + retries.
+            overflow_status, error_body = build_anthropic_error_body(
+                error_info,
+                response.status_code,
+                context_limit=request.app.state.account_manager.get_model_max_input_tokens(request_data.model),
+                max_tokens=request_data.max_tokens or 0,
+                estimated_input_tokens=_estimate_anthropic_input_tokens(request_data),
+            )
             return JSONResponse(
-                status_code=response.status_code,
-                content={
-                    "type": "error",
-                    "error": {
-                        "type": "api_error",
-                        "message": error_message
-                    }
-                }
+                status_code=overflow_status,
+                content=error_body,
             )
         
         if request_data.stream:

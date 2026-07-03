@@ -2453,3 +2453,59 @@ class TestOpenAINonStreamingInterruptionRecovery:
             _ = response.content  # force the streaming generator to run
 
         assert not mock_retry.called, "streaming must not use the non-streaming retry helper"
+
+
+class TestOpenAIContextOverflow:
+    """
+    Kiro CONTENT_LENGTH_EXCEEDS_THRESHOLD must surface as OpenAI's canonical
+    context_length_exceeded / invalid_request_error (HTTP 400) so OpenAI-compatible
+    clients trim history and retry. Streaming and non-streaming share the
+    pre-split error block, so both are covered.
+    """
+
+    _KIRO_OVERFLOW = (
+        b'{"message":"Input content length exceeds threshold.",'
+        b'"reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}'
+    )
+
+    def _post_overflow(self, test_client, valid_proxy_api_key, stream, body_bytes=None):
+        upstream = AsyncMock()
+        upstream.status_code = 400
+        upstream.aread = AsyncMock(return_value=body_bytes or self._KIRO_OVERFLOW)
+        with patch('kiro.http_client.KiroHttpClient.request_with_retry',
+                   new=AsyncMock(return_value=upstream)), \
+             patch('kiro.http_client.KiroHttpClient.close', new=AsyncMock()):
+            return test_client.post(
+                "/v1/chat/completions",
+                headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+                json={
+                    "model": "claude-sonnet-4-5",
+                    "messages": [{"role": "user", "content": "Hi"}],
+                    "stream": stream,
+                },
+            )
+
+    def test_non_streaming_overflow_maps_to_context_length_exceeded(self, test_client, valid_proxy_api_key):
+        """What it does: non-streaming overflow -> 400 context_length_exceeded."""
+        response = self._post_overflow(test_client, valid_proxy_api_key, stream=False)
+        assert response.status_code == 400, response.text
+        body = response.json()
+        assert body["error"]["type"] == "invalid_request_error"
+        assert body["error"]["code"] == "context_length_exceeded"
+        assert "exceed context limit" in body["error"]["message"]
+
+    def test_streaming_overflow_maps_to_context_length_exceeded(self, test_client, valid_proxy_api_key):
+        """What it does: streaming overflow -> same canonical 400 before any bytes stream."""
+        response = self._post_overflow(test_client, valid_proxy_api_key, stream=True)
+        assert response.status_code == 400, response.text
+        body = response.json()
+        assert body["error"]["code"] == "context_length_exceeded"
+
+    def test_generic_400_keeps_kiro_api_error_shape(self, test_client, valid_proxy_api_key):
+        """Purpose: only overflow is relabelled; other 400s stay kiro_api_error (no regression)."""
+        response = self._post_overflow(
+            test_client, valid_proxy_api_key, stream=False,
+            body_bytes=b'{"message":"Improperly formed request."}',
+        )
+        assert response.status_code == 400
+        assert response.json()["error"]["type"] == "kiro_api_error"

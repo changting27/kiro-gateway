@@ -625,3 +625,169 @@ class TestEnhanceImproperlyFormedRequest:
 
         # Should fall through to generic handler, not the size-limit message
         assert "payload size exceeded" not in error_info.user_message
+
+
+# ---------------------------------------------------------------------------
+# Context-window overflow → canonical client-recognized error
+#
+# Claude Code (and OpenAI SDKs) only auto-compact when they receive the exact
+# overflow error shape the native APIs emit. These tests lock that contract:
+# the detection flag, the verbatim message, the number clamping, and both
+# per-API response envelopes.
+# ---------------------------------------------------------------------------
+
+from kiro.config import DEFAULT_MAX_INPUT_TOKENS
+from kiro.kiro_errors import (
+    build_anthropic_error_body,
+    build_openai_error_body,
+    format_context_overflow_message,
+    _resolve_overflow_input_tokens,
+)
+
+
+class TestContextOverflowDetection:
+    """is_context_overflow flag on KiroErrorInfo."""
+
+    def test_reason_code_sets_overflow_flag(self):
+        """The canonical Kiro reason marks the error as a context overflow."""
+        info = enhance_kiro_error({
+            "message": "Input content length exceeds threshold.",
+            "reason": "CONTENT_LENGTH_EXCEEDS_THRESHOLD",
+        })
+        assert info.is_context_overflow is True
+
+    def test_text_fallback_when_reason_unknown(self):
+        """Overflow phrased only in the message (unknown reason) still trips the flag."""
+        for message in (
+            "Input content length exceeds threshold.",
+            "Input is too long.",
+            "Prompt is too long",
+            "The request exceeds threshold for this model.",
+        ):
+            info = enhance_kiro_error({"message": message})
+            assert info.is_context_overflow is True, message
+
+    def test_no_false_positive_with_real_reason(self):
+        """Overflow-ish text must NOT trip the flag when a real reason is present."""
+        info = enhance_kiro_error({
+            "message": "Input is too long.",
+            "reason": "VALIDATION_ERROR",
+        })
+        assert info.is_context_overflow is False
+
+    def test_unrelated_errors_are_not_overflow(self):
+        """Quota / model / generic errors are never flagged as overflow."""
+        for error_json in (
+            {"message": "Monthly limit.", "reason": "MONTHLY_REQUEST_COUNT"},
+            {"message": "Bad model.", "reason": "INVALID_MODEL_ID"},
+            {"message": "Improperly formed request."},
+            {"message": "Something else went wrong.", "reason": "UNKNOWN"},
+        ):
+            info = enhance_kiro_error(error_json)
+            assert info.is_context_overflow is False, error_json
+
+
+class TestFormatContextOverflowMessage:
+    """The message string must match Anthropic's native wording verbatim."""
+
+    def test_exact_wording(self):
+        """Claude Code pattern-matches this phrasing to trigger auto-compaction."""
+        msg = format_context_overflow_message(210000, 8192, 200000)
+        assert msg == (
+            "input length and max_tokens exceed context limit: "
+            "210000 + 8192 > 200000, decrease input length or max_tokens and try again"
+        )
+
+
+class TestResolveOverflowInputTokens:
+    """Number clamping guarantees input + max_tokens > context_limit."""
+
+    def test_estimate_above_limit_used_verbatim(self):
+        """A realistic estimate that already overflows is preserved for display."""
+        assert _resolve_overflow_input_tokens(500000, 8192, 200000) == 500000
+
+    def test_estimate_below_limit_clamped_up(self):
+        """An under-count is raised so the reported inequality stays true."""
+        result = _resolve_overflow_input_tokens(1000, 8192, 200000)
+        assert result + 8192 > 200000
+        assert result == 200000 - 8192 + 1
+
+    def test_none_estimate_clamps_to_just_over_limit(self):
+        """Missing estimate yields the smallest self-consistent overflow."""
+        result = _resolve_overflow_input_tokens(None, 0, 200000)
+        assert result == 200001
+
+    def test_max_tokens_equal_or_greater_than_limit(self):
+        """When max_tokens alone meets/exceeds the limit, input stays >= 1 and overflows."""
+        result = _resolve_overflow_input_tokens(None, 200000, 200000)
+        assert result >= 1
+        assert result + 200000 > 200000
+
+    def test_zero_and_negative_estimate_floored_to_one(self):
+        """Degenerate estimates never produce a non-positive token count."""
+        assert _resolve_overflow_input_tokens(0, 500000, 200000) >= 1
+        assert _resolve_overflow_input_tokens(-50, 500000, 200000) >= 1
+
+
+class TestBuildAnthropicErrorBody:
+    """Anthropic error envelope: overflow → invalid_request_error 400."""
+
+    def test_overflow_returns_canonical_invalid_request_error(self):
+        info = enhance_kiro_error({
+            "message": "Input content length exceeds threshold.",
+            "reason": "CONTENT_LENGTH_EXCEEDS_THRESHOLD",
+        })
+        status, body = build_anthropic_error_body(
+            info, 400, context_limit=200000, max_tokens=8192, estimated_input_tokens=210000
+        )
+        assert status == 400
+        assert body["type"] == "error"
+        assert body["error"]["type"] == "invalid_request_error"
+        assert body["error"]["message"] == (
+            "input length and max_tokens exceed context limit: "
+            "210000 + 8192 > 200000, decrease input length or max_tokens and try again"
+        )
+
+    def test_overflow_forces_400_even_if_upstream_status_differs(self):
+        """Overflow is always a 400 regardless of the upstream status code."""
+        info = enhance_kiro_error({"reason": "CONTENT_LENGTH_EXCEEDS_THRESHOLD", "message": "x"})
+        status, _ = build_anthropic_error_body(info, 500, context_limit=200000)
+        assert status == 400
+
+    def test_overflow_uses_default_limit_when_unspecified(self):
+        info = enhance_kiro_error({"reason": "CONTENT_LENGTH_EXCEEDS_THRESHOLD", "message": "x"})
+        _, body = build_anthropic_error_body(info, 400)
+        assert f"> {DEFAULT_MAX_INPUT_TOKENS}," in body["error"]["message"]
+
+    def test_non_overflow_preserves_api_error_shape_and_status(self):
+        info = enhance_kiro_error({"message": "Improperly formed request."})
+        status, body = build_anthropic_error_body(info, 400)
+        assert status == 400
+        assert body["error"]["type"] == "api_error"
+        assert body["error"]["message"] == info.user_message
+
+
+class TestBuildOpenAIErrorBody:
+    """OpenAI error envelope: overflow → context_length_exceeded 400."""
+
+    def test_overflow_returns_context_length_exceeded(self):
+        info = enhance_kiro_error({
+            "message": "Input content length exceeds threshold.",
+            "reason": "CONTENT_LENGTH_EXCEEDS_THRESHOLD",
+        })
+        status, body = build_openai_error_body(
+            info, 400, context_limit=200000, max_tokens=4096, estimated_input_tokens=205000
+        )
+        assert status == 400
+        assert body["error"]["type"] == "invalid_request_error"
+        assert body["error"]["code"] == "context_length_exceeded"
+        assert body["error"]["param"] == "messages"
+        assert "exceed context limit" in body["error"]["message"]
+
+    def test_non_overflow_preserves_kiro_api_error_shape(self):
+        info = enhance_kiro_error({"message": "Monthly limit.", "reason": "MONTHLY_REQUEST_COUNT"})
+        status, body = build_openai_error_body(info, 402)
+        assert status == 402
+        assert body["error"]["type"] == "kiro_api_error"
+        assert body["error"]["code"] == 402
+        assert body["error"]["message"] == info.user_message

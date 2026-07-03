@@ -37,9 +37,11 @@ Example:
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, Any
+from typing import Any, Dict, Optional, Tuple
 
 from loguru import logger
+
+from kiro.config import DEFAULT_MAX_INPUT_TOKENS
 
 
 @dataclass
@@ -54,10 +56,15 @@ class KiroErrorInfo:
         reason: Error reason code from Kiro API (as string, e.g. "CONTENT_LENGTH_EXCEEDS_THRESHOLD")
         user_message: Enhanced, user-friendly message for end users
         original_message: Original message from Kiro API (for logging)
+        is_context_overflow: True when the error means the conversation exceeded the
+            model's context window. Downstream clients (Claude Code, OpenAI SDKs)
+            only auto-compact when they receive the canonical overflow error shape,
+            so this flag drives the response builders below.
     """
     reason: str
     user_message: str
     original_message: str
+    is_context_overflow: bool = False
 
 
 def enhance_kiro_error(error_json: Dict[str, Any]) -> KiroErrorInfo:
@@ -134,8 +141,178 @@ def enhance_kiro_error(error_json: Dict[str, Any]) -> KiroErrorInfo:
         else:
             user_message = original_message
     
+    # Detect context-window overflow. Kiro signals this primarily via the reason
+    # code, but older/edge responses only carry it in the free-text message, so we
+    # add a conservative text fallback (only when the reason is unknown) to avoid
+    # false positives on unrelated errors.
+    is_context_overflow = reason == "CONTENT_LENGTH_EXCEEDS_THRESHOLD"
+    if not is_context_overflow and reason == "UNKNOWN":
+        lowered = original_message.lower()
+        if (
+            "content length exceeds" in lowered
+            or "exceeds threshold" in lowered
+            or "input is too long" in lowered
+            or "prompt is too long" in lowered
+        ):
+            is_context_overflow = True
+
     return KiroErrorInfo(
         reason=reason,
         user_message=user_message,
-        original_message=original_message
+        original_message=original_message,
+        is_context_overflow=is_context_overflow,
     )
+
+
+def format_context_overflow_message(
+    input_tokens: int,
+    max_tokens: int,
+    context_limit: int,
+) -> str:
+    """
+    Return the canonical Anthropic context-overflow message.
+
+    Claude Code (and OpenAI-compatible clients) detect this exact phrasing to
+    trigger automatic conversation compaction and retry. Reproducing Anthropic's
+    native wording verbatim is what makes downstream auto-compaction fire; a
+    custom message such as "Model context limit reached" is silently ignored by
+    the client, which is why the conversation dead-ends instead of compacting.
+
+    Args:
+        input_tokens: Estimated prompt/input token count.
+        max_tokens: Requested completion budget (max_tokens).
+        context_limit: The model's real input-token limit.
+
+    Returns:
+        A message string of the exact form Anthropic's API emits on overflow.
+
+    Examples:
+        >>> format_context_overflow_message(210000, 8192, 200000)
+        'input length and max_tokens exceed context limit: 210000 + 8192 > 200000, decrease input length or max_tokens and try again'
+    """
+    return (
+        f"input length and max_tokens exceed context limit: "
+        f"{input_tokens} + {max_tokens} > {context_limit}, "
+        f"decrease input length or max_tokens and try again"
+    )
+
+
+def _resolve_overflow_input_tokens(
+    estimated_input_tokens: Optional[int],
+    max_tokens: int,
+    context_limit: int,
+) -> int:
+    """
+    Clamp the input-token count so ``input + max_tokens > context_limit`` holds.
+
+    Kiro already rejected the request for exceeding the window, so the true input
+    size is at least the limit. When the local estimate is missing or under-counts
+    (tokenizers differ from Kiro's accounting), we raise it to the smallest value
+    that keeps the reported inequality self-consistent, so the client treats it as
+    a genuine overflow rather than recomputing and dismissing it.
+
+    Args:
+        estimated_input_tokens: Best-effort local estimate, or None.
+        max_tokens: Requested completion budget.
+        context_limit: The model's real input-token limit.
+
+    Returns:
+        A positive input-token count that satisfies input + max_tokens > limit.
+    """
+    input_tokens = max(estimated_input_tokens or 0, 1)
+    if input_tokens + max_tokens <= context_limit:
+        input_tokens = max(1, context_limit - max_tokens + 1)
+    return input_tokens
+
+
+def build_anthropic_error_body(
+    error_info: KiroErrorInfo,
+    status_code: int,
+    *,
+    context_limit: int = DEFAULT_MAX_INPUT_TOKENS,
+    max_tokens: int = 0,
+    estimated_input_tokens: Optional[int] = None,
+) -> Tuple[int, Dict[str, Any]]:
+    """
+    Render a Kiro error as an Anthropic-format error body.
+
+    Context-overflow errors are re-expressed as Anthropic's canonical
+    ``invalid_request_error`` (HTTP 400) so Claude Code recognises the overflow and
+    triggers auto-compaction + retry. All other errors keep the existing
+    ``api_error`` envelope and original status code.
+
+    Args:
+        error_info: Result of :func:`enhance_kiro_error`.
+        status_code: Original upstream status code (used for non-overflow errors).
+        context_limit: Model input-token limit for the overflow message.
+        max_tokens: Requested completion budget for the overflow message.
+        estimated_input_tokens: Optional local input-token estimate.
+
+    Returns:
+        Tuple of (http_status_code, response_body_dict).
+    """
+    if error_info.is_context_overflow:
+        input_tokens = _resolve_overflow_input_tokens(
+            estimated_input_tokens, max_tokens, context_limit
+        )
+        message = format_context_overflow_message(
+            input_tokens, max_tokens, context_limit
+        )
+        return 400, {
+            "type": "error",
+            "error": {"type": "invalid_request_error", "message": message},
+        }
+    return status_code, {
+        "type": "error",
+        "error": {"type": "api_error", "message": error_info.user_message},
+    }
+
+
+def build_openai_error_body(
+    error_info: KiroErrorInfo,
+    status_code: int,
+    *,
+    context_limit: int = DEFAULT_MAX_INPUT_TOKENS,
+    max_tokens: int = 0,
+    estimated_input_tokens: Optional[int] = None,
+) -> Tuple[int, Dict[str, Any]]:
+    """
+    Render a Kiro error as an OpenAI-format error body.
+
+    Context-overflow errors are re-expressed as OpenAI's canonical
+    ``context_length_exceeded`` / ``invalid_request_error`` (HTTP 400) so
+    OpenAI-compatible clients trigger their own history trimming. All other errors
+    keep the existing ``kiro_api_error`` envelope and original status code.
+
+    Args:
+        error_info: Result of :func:`enhance_kiro_error`.
+        status_code: Original upstream status code (used for non-overflow errors).
+        context_limit: Model input-token limit for the overflow message.
+        max_tokens: Requested completion budget for the overflow message.
+        estimated_input_tokens: Optional local input-token estimate.
+
+    Returns:
+        Tuple of (http_status_code, response_body_dict).
+    """
+    if error_info.is_context_overflow:
+        input_tokens = _resolve_overflow_input_tokens(
+            estimated_input_tokens, max_tokens, context_limit
+        )
+        message = format_context_overflow_message(
+            input_tokens, max_tokens, context_limit
+        )
+        return 400, {
+            "error": {
+                "message": message,
+                "type": "invalid_request_error",
+                "code": "context_length_exceeded",
+                "param": "messages",
+            }
+        }
+    return status_code, {
+        "error": {
+            "message": error_info.user_message,
+            "type": "kiro_api_error",
+            "code": status_code,
+        }
+    }
