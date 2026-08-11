@@ -26,19 +26,15 @@ Contains all API endpoints:
 - /v1/chat/completions: Chat completions
 """
 
-import json
-import functools
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, Security
-from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
 from loguru import logger
 
 from kiro.config import (
     PROXY_API_KEY,
     APP_VERSION,
-    PROFILE_ARN,
     HEALTH_CHECK_METHODS,
     DEFAULT_MAX_INPUT_TOKENS,
 )
@@ -52,15 +48,25 @@ from kiro.cache import ModelInfoCache
 from kiro.model_resolver import ModelResolver
 from kiro.converters_openai import build_kiro_payload
 from kiro.streaming_openai import stream_kiro_to_openai, collect_stream_response, stream_with_first_token_retry
-from kiro.streaming_core import collect_nonstreaming_with_retry
 from kiro.observability import enrich_current_metrics
-from kiro.http_client import KiroHttpClient
-from kiro.utils import generate_conversation_id
 from kiro.config import WEB_SEARCH_ENABLED
 from kiro.mcp_tools import handle_native_web_search
 from typing import Optional
 from kiro.tokenizer import estimate_request_tokens
-from kiro.kiro_errors import enhance_kiro_error, build_openai_error_body
+from kiro.kiro_errors import build_openai_error_body
+
+# Responses API (/v1/responses) — shares the executor with /v1/chat/completions
+from kiro.routes_common import execute_kiro_request
+from kiro.models_responses import ResponsesRequest
+from kiro.converters_responses import (
+    build_kiro_payload_from_responses,
+    build_responses_tokenizer_inputs,
+)
+from kiro.streaming_responses import (
+    stream_kiro_to_responses_with_retry,
+    collect_responses_response,
+    generate_response_id,
+)
 
 # Import debug_logger
 try:
@@ -363,521 +369,219 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
             )
             request_data.tools.append(web_search_tool)
             logger.debug("Auto-injected web_search tool for MCP emulation (Path B)")
-    
-    # ==============================================================================
-    # Account System: Account System Failover or Legacy Mode
-    # ==============================================================================
-    
-    if request.app.state.account_system:
-        # ==============================================================================
-        # ACCOUNT SYSTEM ENABLED: Failover Loop
-        # ==============================================================================
-        from kiro.account_errors import classify_error, ErrorType
-        
-        account_manager = request.app.state.account_manager
-        all_accounts = list(account_manager._accounts.keys())
-        MAX_ATTEMPTS = len(all_accounts) * 2  # Full circle with margin
-        
-        last_error_message = None
-        last_error_status = None
-        tried_accounts = set()  # Track tried accounts in current failover loop
-        
-        for attempt in range(MAX_ATTEMPTS):
-            # Get next available account (excluding already tried)
-            account = await account_manager.get_next_account(
-                request_data.model,
-                exclude_accounts=tried_accounts
-            )
-            
-            if account is None:
-                # All accounts unavailable
-                if len(all_accounts) == 1:
-                    # Single account - return original error with original status code
-                    raise HTTPException(
-                        status_code=last_error_status or 503,
-                        detail=last_error_message or "Account unavailable"
-                    )
-                else:
-                    # Multiple accounts - generic error with context
-                    detail = "No available accounts for this model."
-                    if last_error_message:
-                        detail += f" Error from last account: {last_error_message}"
-                    raise HTTPException(status_code=503, detail=detail)
-            
-            # Mark account as tried in current failover loop
-            tried_accounts.add(account.id)
-            
-            # Use objects from account
-            auth_manager = account.auth_manager
-            model_cache = account.model_cache
-            model_resolver = account.model_resolver
-            
-            # Generate conversation ID
-            conversation_id = generate_conversation_id()
-            
-            # Build payload for Kiro
-            # profileArn is required by runtime.kiro.dev for all auth types
-            profile_arn_for_payload = auth_manager.profile_arn or PROFILE_ARN or ""
-            
-            try:
-                kiro_payload = build_kiro_payload(
-                    request_data,
-                    conversation_id,
-                    profile_arn_for_payload
-                )
-            except ValueError as e:
-                raise HTTPException(status_code=400, detail=str(e))
-            
-            # Log Kiro payload
-            try:
-                kiro_request_body = json.dumps(kiro_payload, ensure_ascii=False, indent=2).encode('utf-8')
-                if debug_logger:
-                    debug_logger.log_kiro_request_body(kiro_request_body)
-            except Exception as e:
-                logger.warning(f"Failed to log Kiro request: {e}")
-            
-            # Create HTTP client
-            url = f"{auth_manager.api_host}/generateAssistantResponse"
-            logger.debug(f"Kiro API URL: {url} (account: {account.id})")
-            
-            if request_data.stream:
-                http_client = KiroHttpClient(auth_manager, shared_client=None)
-            else:
-                shared_client = request.app.state.http_client
-                http_client = KiroHttpClient(auth_manager, shared_client=shared_client)
-            
-            try:
-                # Make request to Kiro API
-                response = await http_client.request_with_retry(
-                    "POST",
-                    url,
-                    kiro_payload,
-                    stream=True
-                )
-                
-                if response.status_code == 200:
-                    # SUCCESS - report and return
-                    await account_manager.report_success(account.id, request_data.model)
-                    
-                    # Prepare data for token counting
-                    messages_for_tokenizer = [msg.model_dump() for msg in request_data.messages]
-                    tools_for_tokenizer = [tool.model_dump() for tool in request_data.tools] if request_data.tools else None
-                    
-                    if request_data.stream:
-                        # Streaming mode
-                        async def stream_wrapper():
-                            streaming_error = None
-                            client_disconnected = False
-                            try:
-                                async def make_retry_request():
-                                    return await http_client.request_with_retry(
-                                        "POST", url, kiro_payload, stream=True
-                                    )
-                                
-                                async for chunk in stream_with_first_token_retry(
-                                    make_request=make_retry_request,
-                                    client=http_client.client,
-                                    model=request_data.model,
-                                    model_cache=model_cache,
-                                    auth_manager=auth_manager,
-                                    initial_response=response,
-                                    request_messages=messages_for_tokenizer,
-                                    request_tools=tools_for_tokenizer
-                                ):
-                                    yield chunk
-                            except GeneratorExit:
-                                client_disconnected = True
-                                logger.debug("Client disconnected during streaming (GeneratorExit in routes)")
-                            except Exception as e:
-                                streaming_error = e
-                                try:
-                                    yield "data: [DONE]\n\n"
-                                except Exception:
-                                    pass
-                                raise
-                            finally:
-                                await http_client.close()
-                                if streaming_error:
-                                    error_type = type(streaming_error).__name__
-                                    error_msg = str(streaming_error) if str(streaming_error) else "(empty message)"
-                                    logger.error(f"HTTP 500 - POST /v1/chat/completions (streaming) - [{error_type}] {error_msg[:100]}")
-                                elif client_disconnected:
-                                    logger.info(f"HTTP 200 - POST /v1/chat/completions (streaming) - client disconnected")
-                                else:
-                                    logger.info(f"HTTP 200 - POST /v1/chat/completions (streaming) - completed")
-                                if debug_logger:
-                                    if streaming_error:
-                                        debug_logger.flush_on_error(500, str(streaming_error))
-                                    else:
-                                        debug_logger.discard_buffers()
-                        
-                        return StreamingResponse(stream_wrapper(), media_type="text/event-stream")
-                    
-                    else:
-                        # Non-streaming mode. A mid-response disconnect
-                        # (UpstreamStreamError) is safe to retry here because no bytes
-                        # have reached the client yet - the JSONResponse below is only
-                        # built after the upstream stream is fully collected.
-                        openai_response = await collect_nonstreaming_with_retry(
-                            initial_response=response,
-                            make_request=functools.partial(
-                                http_client.request_with_retry,
-                                "POST", url, kiro_payload, stream=True
-                            ),
-                            collect=lambda _resp: collect_stream_response(
-                                http_client.client,
-                                _resp,
-                                request_data.model,
-                                model_cache,
-                                auth_manager,
-                                request_messages=messages_for_tokenizer,
-                                request_tools=tools_for_tokenizer
-                            ),
-                        )
-                        
-                        await http_client.close()
-                        logger.info(f"HTTP 200 - POST /v1/chat/completions (non-streaming) - completed")
-                        
-                        if debug_logger:
-                            debug_logger.discard_buffers()
-                        
-                        return JSONResponse(content=openai_response)
-                
-                else:
-                    # ERROR - classify and decide
-                    try:
-                        error_content = await response.aread()
-                    except Exception:
-                        error_content = b"Unknown error"
-                    
-                    await http_client.close()
-                    error_text = error_content.decode('utf-8', errors='replace')
-                    
-                    # Extract error reason and save for final return.
-                    # Run non-JSON bodies through the enhancer too, so the
-                    # text-based context-overflow fallback can still fire.
-                    try:
-                        error_json = json.loads(error_text)
-                        error_info = enhance_kiro_error(error_json)
-                    except (json.JSONDecodeError, KeyError):
-                        error_info = enhance_kiro_error({"message": error_text})
-                    error_reason = error_info.reason
-                    last_error_message = error_info.user_message
-                    last_error_status = response.status_code
-                    logger.debug(f"Original Kiro error: {error_info.original_message} (reason: {error_info.reason})")
-                    
-                    # Classify error
-                    error_type = classify_error(response.status_code, error_reason)
-                    
-                    if error_type == ErrorType.FATAL:
-                        # FATAL - return to client immediately
-                        await account_manager.report_failure(
-                            account.id, request_data.model, error_type,
-                            response.status_code, error_reason
-                        )
-                        
-                        logger.warning(f"HTTP {response.status_code} - POST /v1/chat/completions - {last_error_message[:100]}")
-                        
-                        if debug_logger:
-                            debug_logger.flush_on_error(response.status_code, last_error_message)
-                        
-                        # Context-overflow is re-shaped into OpenAI's canonical
-                        # context_length_exceeded so clients trim history + retry.
-                        overflow_status, error_body = build_openai_error_body(
-                            error_info,
-                            response.status_code,
-                            context_limit=account_manager.get_model_max_input_tokens(request_data.model),
-                            max_tokens=request_data.max_tokens or 0,
-                            estimated_input_tokens=_estimate_openai_input_tokens(request_data),
-                        )
-                        return JSONResponse(
-                            status_code=overflow_status,
-                            content=error_body,
-                        )
-                    
-                    else:  # ErrorType.RECOVERABLE
-                        # RECOVERABLE - try next account
-                        await account_manager.report_failure(
-                            account.id, request_data.model, error_type,
-                            response.status_code, error_reason
-                        )
-                        
-                        # Single account - no point in failover, break immediately
-                        if len(all_accounts) == 1:
-                            break
-                        
-                        continue  # Next iteration
-            
-            except HTTPException as e:
-                await http_client.close()
-                
-                # Network errors (502/504 from request_with_retry) = RECOVERABLE
-                # These are thrown ONLY for network-level issues (timeouts, connection errors)
-                # NOT for HTTP-level errors (which are returned as response objects)
-                if e.status_code in (502, 504):
-                    # Network error → try next account
-                    await account_manager.report_failure(
-                        account.id, request_data.model, ErrorType.RECOVERABLE,
-                        e.status_code, None
-                    )
-                    
-                    last_error_message = str(e.detail)
-                    last_error_status = e.status_code
-                    
-                    # Single account - no point in failover, break immediately
-                    if len(all_accounts) == 1:
-                        break
-                    
-                    logger.warning(f"Network error on account {account.id}, trying next account")
-                    continue  # Try next account
-                
-                # All other HTTPException (400, 500, etc.) = application errors
-                # These come from build_kiro_payload() or other places → re-raise immediately
-                logger.error(f"HTTP {e.status_code} - POST /v1/chat/completions - {e.detail}")
-                if debug_logger:
-                    debug_logger.flush_on_error(e.status_code, str(e.detail))
-                raise
-            except Exception as e:
-                await http_client.close()
-                logger.error(f"Internal error: {e}", exc_info=True)
-                logger.error(f"HTTP 500 - POST /v1/chat/completions - {str(e)[:100]}")
-                if debug_logger:
-                    debug_logger.flush_on_error(500, str(e))
-                raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
-        
-        # All attempts exhausted
-        if len(all_accounts) == 1:
-            # Single account - return its original error
-            # last_error_status and last_error_message are guaranteed to be set
-            raise HTTPException(
-                status_code=last_error_status,
-                detail=last_error_message
-            )
-        else:
-            # Multiple accounts - generic error with context
-            detail = "All accounts failed after full circle."
-            if last_error_message:
-                detail += f" Error from last account: {last_error_message}"
-            raise HTTPException(status_code=503, detail=detail)
-    
-    else:
-        # ==============================================================================
-        # LEGACY MODE: Single Account (no failover)
-        # ==============================================================================
-        account = request.app.state.account_manager.get_first_account()
-        if not account.auth_manager:
-            logger.error("No initialized accounts available (legacy mode)")
-            raise HTTPException(503, "No initialized accounts available")
-        auth_manager = account.auth_manager
-        model_cache = account.model_cache
-        model_resolver = account.model_resolver
-    
-    # Generate conversation ID for Kiro API (random UUID, not used for tracking)
-    conversation_id = generate_conversation_id()
-    
-    # Build payload for Kiro
-    # profileArn is required by runtime.kiro.dev for all auth types
-    profile_arn_for_payload = auth_manager.profile_arn or PROFILE_ARN or ""
-    
-    try:
-        kiro_payload = build_kiro_payload(
-            request_data,
-            conversation_id,
-            profile_arn_for_payload
+
+    # ------------------------------------------------------------------------------
+    # Delegate to the shared Kiro request executor (routes_common.execute_kiro_request).
+    # Only the payload builder, SSE formatter, response collector, and error-body
+    # shaper are OpenAI-Chat-specific; the account-failover / legacy / error-handling
+    # machinery is shared with /v1/responses (single source of truth).
+    # ------------------------------------------------------------------------------
+    messages_for_tokenizer = [msg.model_dump() for msg in request_data.messages]
+    tools_for_tokenizer = (
+        [tool.model_dump() for tool in request_data.tools] if request_data.tools else None
+    )
+
+    def _build_payload(conversation_id: str, profile_arn: str) -> dict:
+        """Build the Kiro payload from the OpenAI Chat request."""
+        return build_kiro_payload(request_data, conversation_id, profile_arn)
+
+    def _make_stream(*, http_client, initial_response, make_retry_request, auth_manager, model_cache):
+        """Produce the OpenAI Chat SSE stream (with first-token retry)."""
+        return stream_with_first_token_retry(
+            make_request=make_retry_request,
+            client=http_client.client,
+            model=request_data.model,
+            model_cache=model_cache,
+            auth_manager=auth_manager,
+            initial_response=initial_response,
+            request_messages=messages_for_tokenizer,
+            request_tools=tools_for_tokenizer,
         )
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    
-    # Log Kiro payload
-    try:
-        kiro_request_body = json.dumps(kiro_payload, ensure_ascii=False, indent=2).encode('utf-8')
-        if debug_logger:
-            debug_logger.log_kiro_request_body(kiro_request_body)
-    except Exception as e:
-        logger.warning(f"Failed to log Kiro request: {e}")
-    
-    # Create HTTP client with retry logic
-    # For streaming: use per-request client to avoid CLOSE_WAIT leak on VPN disconnect (issue #54)
-    # For non-streaming: use shared client for connection pooling
-    url = f"{auth_manager.api_host}/generateAssistantResponse"
-    logger.debug(f"Kiro API URL: {url}")
-    
-    if request_data.stream:
-        # Streaming mode: per-request client prevents orphaned connections
-        # when network interface changes (VPN disconnect/reconnect)
-        http_client = KiroHttpClient(auth_manager, shared_client=None)
-    else:
-        # Non-streaming mode: shared client for efficient connection reuse
-        shared_client = request.app.state.http_client
-        http_client = KiroHttpClient(auth_manager, shared_client=shared_client)
-    try:
-        # Make request to Kiro API (for both streaming and non-streaming modes)
-        # Important: we wait for Kiro response BEFORE returning StreamingResponse,
-        # so that 200 OK means Kiro accepted the request and started responding
-        response = await http_client.request_with_retry(
-            "POST",
-            url,
-            kiro_payload,
-            stream=True
+
+    async def _collect(*, http_client, response, auth_manager, model_cache):
+        """Collect a full non-streaming OpenAI Chat response."""
+        return await collect_stream_response(
+            http_client.client,
+            response,
+            request_data.model,
+            model_cache,
+            auth_manager,
+            request_messages=messages_for_tokenizer,
+            request_tools=tools_for_tokenizer,
         )
-        
-        if response.status_code != 200:
-            try:
-                error_content = await response.aread()
-            except Exception:
-                error_content = b"Unknown error"
-            
-            await http_client.close()
-            error_text = error_content.decode('utf-8', errors='replace')
-            
-            # Parse Kiro's error; run non-JSON bodies through the enhancer too so
-            # the text-based context-overflow fallback can still fire.
-            try:
-                error_json = json.loads(error_text)
-                error_info = enhance_kiro_error(error_json)
-            except (json.JSONDecodeError, KeyError):
-                error_info = enhance_kiro_error({"message": error_text})
-            error_message = error_info.user_message
-            logger.debug(f"Original Kiro error: {error_info.original_message} (reason: {error_info.reason})")
-            
-            # Log access log for error (before flush, so it gets into app_logs)
-            logger.warning(
-                f"HTTP {response.status_code} - POST /v1/chat/completions - {error_message[:100]}"
-            )
-            
-            # Flush debug logs on error ("errors" mode)
-            if debug_logger:
-                debug_logger.flush_on_error(response.status_code, error_message)
-            
-            # Context-overflow is re-shaped into OpenAI's canonical
-            # context_length_exceeded so clients trim history + retry.
-            overflow_status, error_body = build_openai_error_body(
-                error_info,
-                response.status_code,
-                context_limit=request.app.state.account_manager.get_model_max_input_tokens(request_data.model),
-                max_tokens=request_data.max_tokens or 0,
-                estimated_input_tokens=_estimate_openai_input_tokens(request_data),
-            )
-            return JSONResponse(
-                status_code=overflow_status,
-                content=error_body,
-            )
-        
-        # Prepare data for fallback token counting
-        # Convert Pydantic models to dicts for tokenizer
-        messages_for_tokenizer = [msg.model_dump() for msg in request_data.messages]
-        tools_for_tokenizer = [tool.model_dump() for tool in request_data.tools] if request_data.tools else None
-        
-        if request_data.stream:
-            # Streaming mode with first token retry
-            async def stream_wrapper():
-                streaming_error = None
-                client_disconnected = False
-                try:
-                    # Create retry request function for retries
-                    async def make_retry_request():
-                        return await http_client.request_with_retry(
-                            "POST", url, kiro_payload, stream=True
-                        )
-                    
-                    # Use retry wrapper with initial response
-                    async for chunk in stream_with_first_token_retry(
-                        make_request=make_retry_request,
-                        client=http_client.client,
-                        model=request_data.model,
-                        model_cache=model_cache,
-                        auth_manager=auth_manager,
-                        initial_response=response,
-                        request_messages=messages_for_tokenizer,
-                        request_tools=tools_for_tokenizer
-                    ):
-                        yield chunk
-                except GeneratorExit:
-                    # Client disconnected - this is normal
-                    client_disconnected = True
-                    logger.debug("Client disconnected during streaming (GeneratorExit in routes)")
-                except Exception as e:
-                    streaming_error = e
-                    # Try to send [DONE] to client before finishing
-                    # so client doesn't "hang" waiting for data
-                    try:
-                        yield "data: [DONE]\n\n"
-                    except Exception:
-                        pass  # Client already disconnected
-                    raise
-                finally:
-                    await http_client.close()
-                    # Log access log for streaming (success or error)
-                    if streaming_error:
-                        error_type = type(streaming_error).__name__
-                        error_msg = str(streaming_error) if str(streaming_error) else "(empty message)"
-                        logger.error(f"HTTP 500 - POST /v1/chat/completions (streaming) - [{error_type}] {error_msg[:100]}")
-                    elif client_disconnected:
-                        logger.info(f"HTTP 200 - POST /v1/chat/completions (streaming) - client disconnected")
-                    else:
-                        logger.info(f"HTTP 200 - POST /v1/chat/completions (streaming) - completed")
-                    # Write debug logs AFTER streaming completes
-                    if debug_logger:
-                        if streaming_error:
-                            debug_logger.flush_on_error(500, str(streaming_error))
-                        else:
-                            debug_logger.discard_buffers()
-            
-            return StreamingResponse(stream_wrapper(), media_type="text/event-stream")
-        
-        else:
-            
-            # Non-streaming mode - collect entire response. A mid-response disconnect
-            # (UpstreamStreamError) is safe to retry here because no bytes have reached
-            # the client yet - the JSONResponse below is only built after full collection.
-            openai_response = await collect_nonstreaming_with_retry(
-                initial_response=response,
-                make_request=functools.partial(
-                    http_client.request_with_retry,
-                    "POST", url, kiro_payload, stream=True
-                ),
-                collect=lambda _resp: collect_stream_response(
-                    http_client.client,
-                    _resp,
-                    request_data.model,
-                    model_cache,
-                    auth_manager,
-                    request_messages=messages_for_tokenizer,
-                    request_tools=tools_for_tokenizer
-                ),
-            )
-            
-            await http_client.close()
-            
-            # Log access log for non-streaming success
-            logger.info(f"HTTP 200 - POST /v1/chat/completions (non-streaming) - completed")
-            
-            # Write debug logs after non-streaming request completes
-            if debug_logger:
-                debug_logger.discard_buffers()
-            
-            return JSONResponse(content=openai_response)
-    
-    except HTTPException as e:
-        await http_client.close()
-        
-        # Network errors (502/504 from request_with_retry) = RECOVERABLE
-        # In legacy mode, we still log them but re-raise (no failover available)
-        if e.status_code in (502, 504):
-            logger.warning(f"Network error (legacy mode, no failover available)")
-        
-        # Log access log for HTTP error
-        logger.error(f"HTTP {e.status_code} - POST /v1/chat/completions - {e.detail}")
-        # Flush debug logs on HTTP error ("errors" mode)
-        if debug_logger:
-            debug_logger.flush_on_error(e.status_code, str(e.detail))
-        raise
-    except Exception as e:
-        await http_client.close()
-        logger.error(f"Internal error: {e}", exc_info=True)
-        # Log access log for internal error
-        logger.error(f"HTTP 500 - POST /v1/chat/completions - {str(e)[:100]}")
-        # Flush debug logs on internal error ("errors" mode)
-        if debug_logger:
-            debug_logger.flush_on_error(500, str(e))
-        raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
+
+    def _build_error(error_info, status_code: int, context_limit: int):
+        """Shape a Kiro error into an OpenAI-style error body."""
+        return build_openai_error_body(
+            error_info,
+            status_code,
+            context_limit=context_limit,
+            max_tokens=request_data.max_tokens or 0,
+            estimated_input_tokens=_estimate_openai_input_tokens(request_data),
+        )
+
+    return await execute_kiro_request(
+        request=request,
+        model=request_data.model,
+        stream=request_data.stream,
+        endpoint="/v1/chat/completions",
+        build_payload=_build_payload,
+        make_stream=_make_stream,
+        collect_response=_collect,
+        build_error_response=_build_error,
+    )
+
+
+def _estimate_responses_input_tokens(request_data) -> Optional[int]:
+    """
+    Best-effort input-token estimate for the Responses context-overflow message.
+
+    Mirrors ``_estimate_openai_input_tokens`` but flattens the Responses ``input``
+    into tokenizer-friendly messages first. Strictly cosmetic (the error builder
+    clamps to a self-consistent value when this returns None), so any estimation
+    failure is swallowed rather than masking the real API error.
+
+    Args:
+        request_data: The incoming ResponsesRequest.
+
+    Returns:
+        Estimated total input tokens, or None if estimation failed.
+    """
+    try:
+        messages_for_tokenizer, tools_for_tokenizer = build_responses_tokenizer_inputs(request_data)
+        stats = estimate_request_tokens(
+            messages=messages_for_tokenizer,
+            tools=tools_for_tokenizer,
+            system_prompt=None,
+            apply_claude_correction=True,
+        )
+        return stats["total_tokens"]
+    except Exception as exc:  # best-effort estimate; must never mask the real error
+        logger.debug(
+            f"Responses input-token estimate failed, using clamp fallback: {exc}"
+        )
+        return None
+
+
+@router.post("/v1/responses", dependencies=[Depends(verify_api_key)])
+async def responses(request: Request, request_data: ResponsesRequest):
+    """
+    Responses endpoint - compatible with the OpenAI Responses API.
+
+    This is the protocol required by current Codex CLI / IDE builds (support for
+    ``wire_api = "chat"`` was removed in February 2026). It accepts a Responses
+    request, translates it to a single Kiro generateAssistantResponse call, and
+    returns either a streamed sequence of typed Responses SSE events or a
+    collected ``response`` object — with full function-calling and reasoning
+    (thinking → reasoning summary) support.
+
+    Streaming and non-streaming share the same account-failover, retry, and
+    error-handling machinery as ``/v1/chat/completions`` via
+    ``routes_common.execute_kiro_request``.
+
+    Args:
+        request: FastAPI Request for accessing app.state.
+        request_data: Request in OpenAI Responses format.
+
+    Returns:
+        StreamingResponse for streaming mode, JSONResponse for non-streaming mode.
+
+    Raises:
+        HTTPException: On validation or upstream API errors.
+    """
+    logger.info(
+        f"Request to /v1/responses (model={request_data.model}, stream={request_data.stream})"
+    )
+
+    # Observability: attach request semantics to the per-request metrics.
+    input_count = len(request_data.input) if isinstance(request_data.input, list) else 1
+    enrich_current_metrics(
+        api="openai",
+        model=request_data.model,
+        stream=bool(request_data.stream),
+        message_count=input_count,
+        tool_count=len(request_data.tools) if request_data.tools else 0,
+    )
+
+    # Tokenizer inputs for FALLBACK prompt-token counting (primary source is
+    # Kiro's context-usage percentage; used only when that is absent).
+    messages_for_tokenizer, tools_for_tokenizer = build_responses_tokenizer_inputs(request_data)
+
+    # Stable response id shared by response.created / response.completed events and
+    # the non-streaming body, so one logical response carries one id.
+    response_id = generate_response_id()
+
+    # Request fields echoed back on the response object (OpenAI clients read these).
+    base_response = {
+        "instructions": request_data.instructions,
+        "tools": (
+            [tool.model_dump(exclude_none=True) for tool in request_data.tools]
+            if request_data.tools else []
+        ),
+        "tool_choice": request_data.tool_choice if request_data.tool_choice is not None else "auto",
+        "temperature": request_data.temperature,
+        "top_p": request_data.top_p,
+        "max_output_tokens": request_data.max_output_tokens,
+        "parallel_tool_calls": (
+            request_data.parallel_tool_calls if request_data.parallel_tool_calls is not None else True
+        ),
+        "reasoning": (
+            request_data.reasoning.model_dump(exclude_none=True) if request_data.reasoning else None
+        ),
+        "metadata": request_data.metadata,
+        "previous_response_id": request_data.previous_response_id,
+    }
+
+    def _build_payload(conversation_id: str, profile_arn: str) -> dict:
+        """Build the Kiro payload from the Responses request."""
+        return build_kiro_payload_from_responses(request_data, conversation_id, profile_arn)
+
+    def _make_stream(*, http_client, initial_response, make_retry_request, auth_manager, model_cache):
+        """Produce the Responses SSE stream (with first-token retry)."""
+        return stream_kiro_to_responses_with_retry(
+            make_request=make_retry_request,
+            client=http_client.client,
+            model=request_data.model,
+            model_cache=model_cache,
+            auth_manager=auth_manager,
+            response_id=response_id,
+            base_response=base_response,
+            initial_response=initial_response,
+            request_messages=messages_for_tokenizer,
+            request_tools=tools_for_tokenizer,
+        )
+
+    async def _collect(*, http_client, response, auth_manager, model_cache):
+        """Collect a full non-streaming Responses ``response`` object."""
+        return await collect_responses_response(
+            http_client.client,
+            response,
+            request_data.model,
+            model_cache,
+            auth_manager,
+            response_id=response_id,
+            base_response=base_response,
+            request_messages=messages_for_tokenizer,
+            request_tools=tools_for_tokenizer,
+        )
+
+    def _build_error(error_info, status_code: int, context_limit: int):
+        """Shape a Kiro error into an OpenAI-style error body (shared envelope)."""
+        return build_openai_error_body(
+            error_info,
+            status_code,
+            context_limit=context_limit,
+            max_tokens=request_data.max_output_tokens or 0,
+            estimated_input_tokens=_estimate_responses_input_tokens(request_data),
+        )
+
+    return await execute_kiro_request(
+        request=request,
+        model=request_data.model,
+        stream=request_data.stream,
+        endpoint="/v1/responses",
+        build_payload=_build_payload,
+        make_stream=_make_stream,
+        collect_response=_collect,
+        build_error_response=_build_error,
+    )

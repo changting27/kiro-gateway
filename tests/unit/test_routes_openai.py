@@ -1077,7 +1077,7 @@ class TestHTTPClientSelection:
     requests use shared client for connection pooling.
     """
     
-    @patch('kiro.routes_openai.KiroHttpClient')
+    @patch('kiro.routes_common.KiroHttpClient')
     def test_streaming_uses_per_request_client(
         self,
         mock_kiro_http_client_class,
@@ -1120,7 +1120,7 @@ class TestHTTPClientSelection:
             "Streaming should use per-request client"
         print("✅ Streaming correctly uses per-request client")
     
-    @patch('kiro.routes_openai.KiroHttpClient')
+    @patch('kiro.routes_common.KiroHttpClient')
     def test_non_streaming_uses_shared_client(
         self,
         mock_kiro_http_client_class,
@@ -2325,7 +2325,7 @@ class TestOpenAINonStreamingInterruptionRecovery:
     """
 
     @patch('kiro.routes_openai.collect_stream_response', new_callable=AsyncMock)
-    @patch('kiro.routes_openai.KiroHttpClient')
+    @patch('kiro.routes_common.KiroHttpClient')
     def test_non_streaming_recovers_after_one_interruption(
         self, mock_client_class, mock_collect, test_client, valid_proxy_api_key
     ):
@@ -2379,7 +2379,7 @@ class TestOpenAINonStreamingInterruptionRecovery:
         assert mock_client.request_with_retry.await_count >= 2  # initial + re-issue
 
     @patch('kiro.routes_openai.collect_stream_response', new_callable=AsyncMock)
-    @patch('kiro.routes_openai.KiroHttpClient')
+    @patch('kiro.routes_common.KiroHttpClient')
     def test_non_streaming_surfaces_error_after_exhausting_retries(
         self, mock_client_class, mock_collect, test_client, valid_proxy_api_key
     ):
@@ -2417,8 +2417,8 @@ class TestOpenAINonStreamingInterruptionRecovery:
         assert response.status_code >= 400  # surfaced as an error, not a silent hang
         assert mock_collect.await_count >= 2  # retried before giving up
 
-    @patch('kiro.routes_openai.collect_nonstreaming_with_retry', new_callable=AsyncMock)
-    @patch('kiro.routes_openai.KiroHttpClient')
+    @patch('kiro.routes_common.collect_nonstreaming_with_retry', new_callable=AsyncMock)
+    @patch('kiro.routes_common.KiroHttpClient')
     def test_streaming_does_not_use_nonstreaming_retry(
         self, mock_client_class, mock_retry, test_client, valid_proxy_api_key
     ):
