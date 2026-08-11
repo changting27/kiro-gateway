@@ -121,6 +121,55 @@ PROXY_API_KEY: str = os.getenv("PROXY_API_KEY", "my-super-secret-password-123")
 VPN_PROXY_URL: str = os.getenv("VPN_PROXY_URL", "")
 
 # ==================================================================================================
+# TLS / Extra CA trust (process-scoped)
+# ==================================================================================================
+# Path to an additional root CA certificate (PEM) that ONLY this gateway process
+# should trust — e.g. a TLS-inspecting proxy's private root CA.
+#
+# This exists so you can satisfy such a TLS-inspecting proxy WITHOUT installing that
+# root CA into the operating system trust store. Installing it system-wide would
+# let the proxy silently intercept EVERY app's HTTPS traffic; here the trust is
+# limited to this gateway's own outbound connections to the Kiro API. Every other
+# program on the machine keeps using the clean system trust store.
+#
+# The extra CA is ADDED on top of the normal default CAs (certifi), so public
+# endpoints still validate normally.
+EXTRA_CA_CERTS: str = os.getenv("KIRO_EXTRA_CA_CERTS", "")
+
+
+def get_ssl_verify():
+    """Build the TLS verification setting for httpx clients.
+
+    Returns an ``ssl.SSLContext`` preloaded with the default trusted CAs plus the
+    extra CA from ``KIRO_EXTRA_CA_CERTS`` when that variable points to a readable
+    PEM file. Otherwise returns ``True`` (default verification, unchanged).
+
+    The returned context is scoped to whichever httpx client uses it — it never
+    touches the OS trust store.
+    """
+    if not EXTRA_CA_CERTS:
+        return True
+
+    ca_path = Path(EXTRA_CA_CERTS).expanduser()
+    if not ca_path.is_file():
+        raise FileNotFoundError(
+            f"KIRO_EXTRA_CA_CERTS is set to '{EXTRA_CA_CERTS}' but no readable "
+            f"certificate file was found there."
+        )
+
+    import httpx  # local import: keeps config import light and avoids cycles
+
+    # create_ssl_context() starts from the default (certifi) trust store, then we
+    # append the extra CA — additive, so normal public TLS still verifies.
+    ctx = httpx.create_ssl_context()
+    ctx.load_verify_locations(cafile=str(ca_path))
+    return ctx
+
+
+# Built once at import; passed as ``verify=`` to every httpx client in this process.
+SSL_VERIFY = get_ssl_verify()
+
+# ==================================================================================================
 # Kiro API Credentials
 # ==================================================================================================
 

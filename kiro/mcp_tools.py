@@ -42,7 +42,7 @@ from loguru import logger
 
 from kiro.tokenizer import count_message_tokens, count_tokens
 from kiro.utils import get_kiro_headers
-from kiro.config import PROFILE_ARN
+from kiro.config import PROFILE_ARN, SSL_VERIFY
 
 # Import debug_logger
 try:
@@ -168,7 +168,10 @@ async def call_kiro_mcp_api(
         mcp_url = f"{auth_manager.q_host}/mcp"
         logger.debug(f"Calling MCP API: {mcp_url}")
         
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(
+            timeout=60.0,
+            verify=SSL_VERIFY,  # process-scoped extra CA trust (see config.get_ssl_verify)
+        ) as client:
             response = await client.post(mcp_url, json=mcp_request, headers=headers)
             
             if response.status_code != 200:

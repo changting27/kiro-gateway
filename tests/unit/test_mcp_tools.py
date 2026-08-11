@@ -687,3 +687,43 @@ class TestOpenAISSEEmulation:
         
         print("Checking for usage information...")
         assert any('"usage"' in chunk for chunk in chunks)
+
+
+class TestCallKiroMCPAPITls:
+    """Tests that the MCP web_search HTTP client honors the process-scoped extra-CA trust."""
+
+    @pytest.mark.asyncio
+    async def test_mcp_client_uses_ssl_verify(self, mock_auth_manager):
+        """
+        What it does: Verifies call_kiro_mcp_api() constructs its httpx.AsyncClient forwarding
+                      verify=SSL_VERIFY.
+        Purpose: web_search calls the Kiro /mcp endpoint through the same TLS-inspecting proxy as
+                 completions; it must trust the extra CA too, otherwise web_search alone would
+                 fail with CERTIFICATE_VERIFY_FAILED while the rest of the gateway works.
+        """
+        import kiro.mcp_tools as mcp_tools
+        query = "extra ca coverage"
+        mock_response_data = {
+            "id": "web_search_tooluse_ssl",
+            "jsonrpc": "2.0",
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps({"results": [], "totalResults": 0, "query": query}),
+                }],
+                "isError": False,
+            },
+        }
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json = Mock(return_value=mock_response_data)
+
+        mock_post = AsyncMock(return_value=mock_response)
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value.post = mock_post
+
+        with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client) as mock_client_class:
+            await call_kiro_mcp_api(query, mock_auth_manager)
+
+        # The client must be built forwarding the module-level SSL_VERIFY object.
+        assert mock_client_class.call_args.kwargs.get("verify") is mcp_tools.SSL_VERIFY

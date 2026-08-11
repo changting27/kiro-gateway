@@ -4251,3 +4251,73 @@ class TestAPIRegionPriorityHierarchy:
         print(f"Result: api_host={manager5._api_host}")
         assert "ap-south-1" in manager5._api_host
 
+
+
+class TestKiroAuthManagerTlsVerification:
+    """Tests that token-refresh HTTP clients honor the process-scoped extra-CA trust.
+
+    The refresh endpoints (Kiro Desktop Auth and AWS SSO OIDC) sit behind the same
+    TLS-inspecting proxy as the Kiro API. If they bypassed KIRO_EXTRA_CA_CERTS
+    they would fail with CERTIFICATE_VERIFY_FAILED even after the request path was fixed.
+    """
+
+    @pytest.mark.asyncio
+    async def test_desktop_refresh_uses_ssl_verify(self, mock_kiro_token_response):
+        """
+        What it does: Verifies _refresh_token_request() constructs its httpx.AsyncClient
+                      forwarding verify=SSL_VERIFY.
+        Purpose: Guarantee Desktop-auth token refresh trusts the extra CA so the
+                 refresh does not fail behind a TLS-inspection proxy.
+        """
+        import kiro.auth as auth
+        manager = KiroAuthManager(refresh_token="test_refresh", region="us-east-1")
+
+        mock_response = AsyncMock()
+        mock_response.status_code = 200
+        mock_response.json = Mock(return_value=mock_kiro_token_response())
+        mock_response.raise_for_status = Mock()
+
+        with patch('kiro.auth.httpx.AsyncClient') as mock_client_class:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=mock_response)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client_class.return_value = mock_client
+
+            await manager._refresh_token_request()
+
+            # The client must be built forwarding the module-level SSL_VERIFY object,
+            # whatever its concrete value (True or an SSLContext) happens to be.
+            assert mock_client_class.call_args.kwargs.get("verify") is auth.SSL_VERIFY
+
+    @pytest.mark.asyncio
+    async def test_aws_sso_oidc_refresh_uses_ssl_verify(self, mock_aws_sso_oidc_token_response):
+        """
+        What it does: Verifies _refresh_token_aws_sso_oidc() constructs its httpx.AsyncClient
+                      forwarding verify=SSL_VERIFY.
+        Purpose: Guarantee the OIDC refresh path (oidc.<region>.amazonaws.com) applies the same
+                 extra-CA trust, keeping TLS behavior consistent across both auth types.
+        """
+        import kiro.auth as auth
+        manager = KiroAuthManager(
+            refresh_token="test_refresh",
+            client_id="test_client_id",
+            client_secret="test_client_secret",
+            region="us-east-1",
+        )
+
+        mock_response = AsyncMock()
+        mock_response.status_code = 200
+        mock_response.json = Mock(return_value=mock_aws_sso_oidc_token_response())
+        mock_response.raise_for_status = Mock()
+
+        with patch('kiro.auth.httpx.AsyncClient') as mock_client_class:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=mock_response)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client_class.return_value = mock_client
+
+            await manager._refresh_token_aws_sso_oidc()
+
+            assert mock_client_class.call_args.kwargs.get("verify") is auth.SSL_VERIFY

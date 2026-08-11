@@ -35,3 +35,11 @@ requests/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Local-only material — never commit to remote:
+#   certs/   : extra-CA trust material referenced by KIRO_EXTRA_CA_CERTS
+#   scripts/ : local host setup / CA install & toggle tooling
+#   patch/   : local development patches
+certs/
+scripts/
+patch/

@@ -70,6 +70,8 @@ from kiro.config import (
     DEFAULT_SERVER_HOST,
     DEFAULT_SERVER_PORT,
     STREAMING_READ_TIMEOUT,
+    SSL_VERIFY,
+    EXTRA_CA_CERTS,
     HIDDEN_MODELS,
     MODEL_ALIASES,
     HIDDEN_FROM_LIST,
@@ -355,9 +357,15 @@ async def lifespan(app: FastAPI):
     app.state.http_client = httpx.AsyncClient(
         limits=limits,
         timeout=timeout,
-        follow_redirects=True
+        follow_redirects=True,
+        verify=SSL_VERIFY  # process-scoped extra CA trust (see config.get_ssl_verify)
     )
     logger.info("Shared HTTP client created with connection pooling")
+    if SSL_VERIFY is not True:
+        logger.info(
+            f"TLS: trusting extra CA from KIRO_EXTRA_CA_CERTS ({EXTRA_CA_CERTS}) "
+            f"for this process only (OS trust store untouched)"
+        )
     
     # ==============================================================================
     # Legacy Fallback: .env → credentials.json

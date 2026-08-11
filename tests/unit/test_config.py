@@ -977,3 +977,89 @@ class TestAccountSystemConfig:
         
         print(f"Comparing STATE_SAVE_INTERVAL_SECONDS: Expected 10, Got {config_module.STATE_SAVE_INTERVAL_SECONDS}")
         assert config_module.STATE_SAVE_INTERVAL_SECONDS == 10
+
+
+# ==================================================================================================
+# Tests for get_ssl_verify() / KIRO_EXTRA_CA_CERTS (process-scoped extra CA trust)
+# ==================================================================================================
+
+# A throwaway self-signed certificate used ONLY to exercise the SSLContext branch of
+# get_ssl_verify(). It is not a secret and is unrelated to any real private CA.
+_TEST_CA_PEM = """-----BEGIN CERTIFICATE-----
+MIIDHzCCAgegAwIBAgIUaFPNiKsL1q+RLwh9P6OqHk7ca18wDQYJKoZIhvcNAQEL
+BQAwHzEdMBsGA1UEAwwUS2lybyBHYXRld2F5IFRlc3QgQ0EwHhcNMjYwNzIxMDIx
+NDEyWhcNMzYwNzE4MDIxNDEyWjAfMR0wGwYDVQQDDBRLaXJvIEdhdGV3YXkgVGVz
+dCBDQTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAN8eciRSCD/LtcnD
+EWGZHa8mWp7s/e9vI5+mqblSkdKXALn9eyCVyuJvu4GTb90yfwlAegE36/xeEC9x
+gAU9G/3x0xeOvdesbDjo3bbReZYEjwnTMd8PwMZzMG+0T6a4DvUjfhAobfIGBR0X
+ZJFmH9KCgDCV3D6GuNgwCo+wMbje9tK/mKnLZ4qS4cP8gaJuutKFQBVuEmDiuyzq
+HgPyzWQ6PrB3Yz/Vihy0I+TW/OQj4z3LDSHue41uGaXkQ/jHE8LDRUhgwfmh/Osu
+vnqDh+pQJB5WKeyeKve8pIj8ROniWXZQa5B8p9A7j8+ocNgK2xZKvbeegsnOR7Vy
+193laP8CAwEAAaNTMFEwHQYDVR0OBBYEFDjXybbUEQFtlfyY8gAVOLuSehwxMB8G
+A1UdIwQYMBaAFDjXybbUEQFtlfyY8gAVOLuSehwxMA8GA1UdEwEB/wQFMAMBAf8w
+DQYJKoZIhvcNAQELBQADggEBAIKjnF0LgLTsuV8HGny+9LPg01vAU1gSV/enSYM0
+pKdtnFjYEgQCpgjZml3KrG0JjAiCCX4czMrYG0hRVI407rJrBu6Ybl4ZRKXiU1H1
+W7kWOxBlMkAPVy5BEo5QWdNpxlk+Mbkc2kxGW9t/PqYMxKRWouJgjkiOJ/+FkjyY
+S6kpX8PMZGA32gzqHI1CCMV7YPl/h99kKzsOaaR+fzZMmZ1Ifts500oSAqXHTxki
+tKroxnml20dMnqpycROVkfjUJW8yLZ8Blc/oj/t5x2Sd010dwkp6n6d/SMdPN33K
+YaB60nFLEP0/l5d7RoD0VfYFgk0SRnUm3teYUdDsifBAH/U=
+-----END CERTIFICATE-----
+"""
+
+
+class TestGetSslVerify:
+    """Tests for get_ssl_verify() and the KIRO_EXTRA_CA_CERTS extra-CA trust setting."""
+
+    def test_returns_true_when_no_extra_ca(self):
+        """
+        What it does: get_ssl_verify() returns True when KIRO_EXTRA_CA_CERTS is unset.
+        Purpose: The default must remain standard certifi verification so that ordinary
+                 public endpoints keep verifying normally when no extra CA is configured.
+        """
+        import kiro.config as config
+        with patch.object(config, "EXTRA_CA_CERTS", ""):
+            result = config.get_ssl_verify()
+        assert result is True
+
+    def test_returns_sslcontext_when_extra_ca_set(self, tmp_path):
+        """
+        What it does: get_ssl_verify() returns an ssl.SSLContext when KIRO_EXTRA_CA_CERTS
+                      points to a readable PEM file.
+        Purpose: The extra root CA must be loaded into a process-scoped SSLContext
+                 (additive on top of certifi), never the OS trust store.
+        """
+        import ssl
+        import kiro.config as config
+        ca_file = tmp_path / "extra-ca.pem"
+        ca_file.write_text(_TEST_CA_PEM)
+        with patch.object(config, "EXTRA_CA_CERTS", str(ca_file)):
+            result = config.get_ssl_verify()
+        assert isinstance(result, ssl.SSLContext)
+
+    def test_expands_user_home_in_path(self, tmp_path, monkeypatch):
+        """
+        What it does: get_ssl_verify() expands a leading ~ in KIRO_EXTRA_CA_CERTS.
+        Purpose: Users commonly store the CA under their home directory; a literal '~'
+                 must resolve to the home path rather than being treated as a filename.
+        """
+        import ssl
+        import kiro.config as config
+        monkeypatch.setenv("HOME", str(tmp_path))
+        ca_file = tmp_path / "extra-ca.pem"
+        ca_file.write_text(_TEST_CA_PEM)
+        with patch.object(config, "EXTRA_CA_CERTS", "~/extra-ca.pem"):
+            result = config.get_ssl_verify()
+        assert isinstance(result, ssl.SSLContext)
+
+    def test_raises_file_not_found_when_ca_missing(self, tmp_path):
+        """
+        What it does: get_ssl_verify() raises FileNotFoundError when KIRO_EXTRA_CA_CERTS
+                      points to a non-existent file.
+        Purpose: A misconfigured path must fail loudly and actionably at startup rather than
+                 silently reverting to default trust (which would reintroduce the SSL error).
+        """
+        import kiro.config as config
+        missing = tmp_path / "does-not-exist.pem"
+        with patch.object(config, "EXTRA_CA_CERTS", str(missing)):
+            with pytest.raises(FileNotFoundError):
+                config.get_ssl_verify()
