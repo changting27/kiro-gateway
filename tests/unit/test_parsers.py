@@ -978,8 +978,8 @@ class TestDiagnoseJsonTruncation:
         Goal: Ensure real truncated JSON from bug is detected.
         """
         print("Setup: Real example from Issue #34...")
-        # This is exact example from log: JSON truncated after filePath
-        json_str = '{"filePath": "/Users/cc/Documents/Code/mock-all/docs/plans/2026-01-12-mock-all-impl.md"'
+        # This preserves the issue's shape without exposing a contributor's local path.
+        json_str = '{"filePath": "/Users/example/Projects/sample-app/docs/plans/sample-plan.md"'
         
         print("Action: Diagnosis...")
         result = aws_event_parser._diagnose_json_truncation(json_str)
@@ -988,7 +988,7 @@ class TestDiagnoseJsonTruncation:
         print(f"Comparing is_truncated: Expected True, Got {result['is_truncated']}")
         assert result["is_truncated"] is True
         assert "brace" in result["reason"]
-        assert result["size_bytes"] == 87  # Exact size from log (char 87 = error position)
+        assert result["size_bytes"] == len(json_str.encode("utf-8"))
     
     def test_multiple_missing_braces_truncated(self, aws_event_parser):
         """
@@ -1378,8 +1378,8 @@ class TestAwsEventStreamParserTruncationDebugFlush:
         Purpose: Tool-call truncation returns HTTP 200, so the raw stream must
             be force-captured for diagnosis instead of silently discarded.
         """
-        # Arrange - 63 bytes, starts with { but no closing brace (real shape)
-        truncated_args = '{"file_path": "/home/mi/work/my_project/kiro-gateway/kiro/par'
+        # Arrange - starts with { but has no closing brace (real truncation shape)
+        truncated_args = '{"file_path": "/workspace/kiro-gateway/kiro/par'
         aws_event_parser.current_tool_call = {
             "id": "tooluse_abc123",
             "type": "function",
