@@ -230,8 +230,21 @@ AWS_SSO_OIDC_URL_TEMPLATE: str = "https://oidc.{region}.amazonaws.com/token"
 # Fixed in issue #58 - codewhisperer.{region}.amazonaws.com doesn't exist for non-us-east-1 regions
 KIRO_API_HOST_TEMPLATE: str = "https://runtime.{region}.kiro.dev"
 
-# Host for Q API (ListAvailableModels)
+# Host for the Kiro-backed MCP tools endpoint (/mcp, used by web_search).
+# This is the runtime host; it is NOT the host that serves ListAvailableModels
+# (see KIRO_MODELS_HOST_TEMPLATE below).
 KIRO_Q_HOST_TEMPLATE: str = "https://runtime.{region}.kiro.dev"
+
+# Host for the model catalog operation (ListAvailableModels).
+#
+# IMPORTANT: ListAvailableModels lives on the AWS Q Developer host
+# (q.{region}.amazonaws.com), NOT on runtime.{region}.kiro.dev — the runtime host
+# answers ListAvailableModels with 404 UnknownOperationException. Keeping this host
+# separate from KIRO_API_HOST_TEMPLATE (generation) and KIRO_Q_HOST_TEMPLATE (/mcp)
+# lets the gateway fetch the real, live model catalog (Opus 5, Sonnet 5, GPT-5.6, …)
+# without changing where generation or web_search are routed. If this host is not
+# reachable in a given region, the model fetch falls back to FALLBACK_MODELS.
+KIRO_MODELS_HOST_TEMPLATE: str = "https://q.{region}.amazonaws.com"
 
 # ==================================================================================================
 # Token Settings
@@ -318,24 +331,32 @@ HIDDEN_FROM_LIST: List[str] = ["auto"]
 # Fallback model list - used when /ListAvailableModels API is unreachable.
 # This ensures basic functionality even with DNS/network issues.
 #
-# IMPORTANT: This list represents known models at the time of this gateway version.
-# - Some models may not be available on your Kiro plan (e.g., Opus on free tier)
-# - New models released after this version won't appear here
-# - Update gateway regularly to get the latest model list
+# IMPORTANT: This list is an offline snapshot of the live catalog served by
+# q.{region}.amazonaws.com/ListAvailableModels. It is ONLY used when the dynamic
+# fetch fails (e.g. the model host is not reachable in the current region). When the
+# fetch succeeds, the real catalog replaces this list.
+# - Availability still depends on your Kiro plan / rollout (Kiro is the final arbiter)
+# - New models released after this version won't appear here until the list is updated
+# - Update the gateway regularly to keep this snapshot current
 FALLBACK_MODELS: List[Dict[str, str]] = [
     {"modelId": "auto"},
-    {"modelId": "claude-sonnet-4"},
-    {"modelId": "claude-sonnet-4.5"},
-    {"modelId": "claude-sonnet-4.6"},
-    {"modelId": "claude-haiku-4.5"},
-    {"modelId": "claude-opus-4.5"},
-    {"modelId": "claude-opus-4.6"},
-    {"modelId": "claude-opus-4.7"},
+    {"modelId": "claude-opus-5"},
+    {"modelId": "claude-sonnet-5"},
     {"modelId": "claude-opus-4.8"},
+    {"modelId": "gpt-5.6-sol"},
+    {"modelId": "gpt-5.6-terra"},
+    {"modelId": "gpt-5.6-luna"},
+    {"modelId": "claude-opus-4.7"},
+    {"modelId": "claude-opus-4.6"},
+    {"modelId": "claude-sonnet-4.6"},
+    {"modelId": "claude-opus-4.5"},
+    {"modelId": "claude-sonnet-4.5"},
+    {"modelId": "claude-sonnet-4"},
+    {"modelId": "claude-haiku-4.5"},
     {"modelId": "deepseek-3.2"},
-    {"modelId": "glm-5"},
-    {"modelId": "minimax-m2.1"},
     {"modelId": "minimax-m2.5"},
+    {"modelId": "minimax-m2.1"},
+    {"modelId": "glm-5"},
     {"modelId": "qwen3-coder-next"},
 ]
 
@@ -674,4 +695,14 @@ def get_kiro_api_host(region: str) -> str:
 def get_kiro_q_host(region: str) -> str:
     """Return Q API host for the specified region."""
     return KIRO_Q_HOST_TEMPLATE.format(region=region)
+
+
+def get_kiro_models_host(region: str) -> str:
+    """Return the ListAvailableModels host (q.{region}.amazonaws.com) for the region.
+
+    This is deliberately separate from :func:`get_kiro_api_host` (generation) and
+    :func:`get_kiro_q_host` (/mcp): the model catalog operation is only served by the
+    AWS Q Developer host, while generation and MCP stay on the runtime host.
+    """
+    return KIRO_MODELS_HOST_TEMPLATE.format(region=region)
 

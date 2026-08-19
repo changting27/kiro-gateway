@@ -1063,3 +1063,84 @@ class TestGetSslVerify:
         with patch.object(config, "EXTRA_CA_CERTS", str(missing)):
             with pytest.raises(FileNotFoundError):
                 config.get_ssl_verify()
+
+
+class TestModelsHostConfig:
+    """Tests for the dedicated ListAvailableModels host (KIRO_MODELS_HOST_TEMPLATE)."""
+
+    def test_models_host_template_uses_aws_q_host(self):
+        """
+        What it does: Verifies KIRO_MODELS_HOST_TEMPLATE targets q.{region}.amazonaws.com.
+        Purpose: ListAvailableModels is only served by the AWS Q host; the runtime host
+                 returns 404 for it. The template must therefore point at the AWS host.
+        """
+        import importlib
+        import kiro.config as config_module
+        importlib.reload(config_module)
+
+        print(f"KIRO_MODELS_HOST_TEMPLATE: {config_module.KIRO_MODELS_HOST_TEMPLATE}")
+        assert config_module.KIRO_MODELS_HOST_TEMPLATE == "https://q.{region}.amazonaws.com"
+
+    def test_get_kiro_models_host_formats_region(self):
+        """
+        What it does: get_kiro_models_host(region) formats the region into the AWS host.
+        Purpose: Ensure the model-catalog fetch targets the correct regional host.
+        """
+        from kiro.config import get_kiro_models_host
+
+        assert get_kiro_models_host("us-east-1") == "https://q.us-east-1.amazonaws.com"
+        assert get_kiro_models_host("eu-central-1") == "https://q.eu-central-1.amazonaws.com"
+
+    def test_models_host_differs_from_generation_and_mcp_hosts(self):
+        """
+        What it does: Verifies the models host is distinct from the generation host
+                      (KIRO_API_HOST_TEMPLATE) and the /mcp host (KIRO_Q_HOST_TEMPLATE).
+        Purpose: Re-pointing the catalog fetch must never disturb generation or web_search,
+                 which stay on the runtime host.
+        """
+        from kiro.config import (
+            KIRO_MODELS_HOST_TEMPLATE,
+            KIRO_API_HOST_TEMPLATE,
+            KIRO_Q_HOST_TEMPLATE,
+        )
+
+        assert KIRO_MODELS_HOST_TEMPLATE != KIRO_API_HOST_TEMPLATE
+        assert KIRO_MODELS_HOST_TEMPLATE != KIRO_Q_HOST_TEMPLATE
+        assert "runtime." in KIRO_API_HOST_TEMPLATE
+        assert "runtime." in KIRO_Q_HOST_TEMPLATE
+        assert "amazonaws.com" in KIRO_MODELS_HOST_TEMPLATE
+
+
+class TestFallbackModelsLatestCatalog:
+    """Tests that FALLBACK_MODELS reflects the current live catalog superset."""
+
+    def test_fallback_includes_latest_models(self):
+        """
+        What it does: Verifies the newest models (Opus 5, Sonnet 5, GPT-5.6 variants,
+                      Opus 4.8) are present in the offline fallback snapshot.
+        Purpose: When the dynamic catalog fetch is unavailable, /v1/models must still
+                 advertise the newest models so clients can select them.
+        """
+        from kiro.config import FALLBACK_MODELS
+
+        ids = {m["modelId"] for m in FALLBACK_MODELS}
+        print(f"Fallback model IDs: {sorted(ids)}")
+        for expected in [
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-opus-4.8",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+        ]:
+            assert expected in ids, f"{expected} missing from FALLBACK_MODELS"
+
+    def test_fallback_has_no_duplicate_model_ids(self):
+        """
+        What it does: Verifies FALLBACK_MODELS has no duplicate modelIds.
+        Purpose: Duplicates would inflate /v1/models and waste cache slots.
+        """
+        from kiro.config import FALLBACK_MODELS
+
+        ids = [m["modelId"] for m in FALLBACK_MODELS]
+        assert len(ids) == len(set(ids)), "Duplicate modelId in FALLBACK_MODELS"

@@ -47,6 +47,7 @@ from kiro.config import (
     get_kiro_refresh_url,
     get_kiro_api_host,
     get_kiro_q_host,
+    get_kiro_models_host,
     get_aws_sso_oidc_url,
 )
 from kiro.utils import get_machine_fingerprint
@@ -222,6 +223,10 @@ class KiroAuthManager:
         self._refresh_url = get_kiro_refresh_url(sso_region_for_oidc)
         self._api_host = get_kiro_api_host(final_api_region)
         self._q_host = get_kiro_q_host(final_api_region)
+        # Host that serves ListAvailableModels (q.{region}.amazonaws.com). Separate from
+        # _api_host (generation) and _q_host (/mcp) so the model-catalog fetch can hit the
+        # AWS Q host even while generation stays on the runtime host.
+        self._models_host = get_kiro_models_host(final_api_region)
         
         # Log initialized endpoints for diagnostics (helps with DNS issues like #58, #132, #133)
         logger.info(
@@ -973,6 +978,11 @@ class KiroAuthManager:
         """Q API host for the current region."""
         return self._q_host
     
+    @property
+    def models_host(self) -> str:
+        """Host serving ListAvailableModels (q.{region}.amazonaws.com) for the region."""
+        return self._models_host
+
     @property
     def fingerprint(self) -> str:
         """Unique machine fingerprint."""

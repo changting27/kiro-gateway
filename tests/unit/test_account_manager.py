@@ -1459,3 +1459,122 @@ class TestFormatDuration:
         """Test formatting days."""
         assert _format_duration(86400) == "1d"
         assert _format_duration(172800) == "2d"
+
+
+class TestAccountManagerModelsHostFetch:
+    """
+    Tests that account initialization fetches the live model catalog from the
+    dedicated AWS models host (q.{region}.amazonaws.com/ListAvailableModels).
+    """
+
+    @pytest.mark.asyncio
+    async def test_initialize_fetches_from_models_host_with_profile_arn(
+        self, tmp_path, mock_list_models_response
+    ):
+        """
+        What it does: Verifies _initialize_account calls ListAvailableModels on the AWS
+                      models host and includes origin + profileArn params, then populates
+                      the dynamic catalog into the account's resolver.
+        Purpose: This is the core fix - the gateway must discover the real, live catalog
+                 (Opus 5, Sonnet 5, GPT-5.6, ...) instead of skipping the fetch and using
+                 only the static fallback.
+        """
+        print("\n=== Test: initialize fetches catalog from models_host ===")
+
+        test_json = tmp_path / "test.json"
+        test_json.write_text(json.dumps({
+            "refreshToken": "test_token",
+            "accessToken": "test_access",
+            "expiresAt": "2099-01-01T00:00:00.000Z",
+            "profileArn": "arn:aws:codewhisperer:us-east-1:123456789:profile/test",
+            "region": "us-east-1",
+        }))
+
+        creds_file = tmp_path / "credentials.json"
+        creds_file.write_text(json.dumps([
+            {"type": "json", "path": str(test_json), "enabled": True}
+        ]))
+
+        manager = AccountManager(
+            credentials_file=str(creds_file),
+            state_file=str(tmp_path / "state.json"),
+        )
+        await manager.load_credentials()
+        account_id = str(test_json.resolve())
+
+        with patch('kiro.account_manager.KiroHttpClient') as mock_http_class:
+            mock_client = AsyncMock()
+            mock_response = Mock()
+            mock_response.status_code = 200
+            mock_response.json.return_value = mock_list_models_response
+            mock_client.request_with_retry = AsyncMock(return_value=mock_response)
+            mock_client.close = AsyncMock()
+            mock_http_class.return_value = mock_client
+
+            success = await manager._initialize_account(account_id)
+
+        assert success is True
+
+        # The request must target the AWS models host, not the runtime host.
+        await_kwargs = mock_client.request_with_retry.await_args.kwargs
+        print(f"request_with_retry kwargs: {await_kwargs}")
+        assert await_kwargs["url"] == "https://q.us-east-1.amazonaws.com/ListAvailableModels"
+        assert await_kwargs["params"]["origin"] == "AI_EDITOR"
+        assert await_kwargs["params"]["profileArn"] == \
+            "arn:aws:codewhisperer:us-east-1:123456789:profile/test"
+
+        # The dynamic catalog from the mocked response must be visible via the resolver.
+        available = manager._accounts[account_id].model_resolver.get_available_models()
+        print(f"Available models after init: {available}")
+        assert "claude-opus-4.5" in available
+        assert "claude-sonnet-4.5" in available
+
+    @pytest.mark.asyncio
+    async def test_initialize_uses_models_host_even_on_runtime_generation(
+        self, tmp_path, mock_list_models_response
+    ):
+        """
+        What it does: Confirms the catalog fetch host is the AWS models host regardless of
+                      the generation host being runtime.{region}.kiro.dev.
+        Purpose: Regression guard for the old behavior that skipped ListAvailableModels
+                 whenever the generation host was the runtime host.
+        """
+        print("\n=== Test: models_host used even though generation host is runtime ===")
+
+        test_json = tmp_path / "test.json"
+        test_json.write_text(json.dumps({
+            "refreshToken": "test_token",
+            "accessToken": "test_access",
+            "expiresAt": "2099-01-01T00:00:00.000Z",
+            "region": "us-east-1",
+        }))
+
+        creds_file = tmp_path / "credentials.json"
+        creds_file.write_text(json.dumps([
+            {"type": "json", "path": str(test_json), "enabled": True}
+        ]))
+
+        manager = AccountManager(
+            credentials_file=str(creds_file),
+            state_file=str(tmp_path / "state.json"),
+        )
+        await manager.load_credentials()
+        account_id = str(test_json.resolve())
+
+        with patch('kiro.account_manager.KiroHttpClient') as mock_http_class:
+            mock_client = AsyncMock()
+            mock_response = Mock()
+            mock_response.status_code = 200
+            mock_response.json.return_value = mock_list_models_response
+            mock_client.request_with_retry = AsyncMock(return_value=mock_response)
+            mock_client.close = AsyncMock()
+            mock_http_class.return_value = mock_client
+
+            await manager._initialize_account(account_id)
+
+        auth_manager = manager._accounts[account_id].auth_manager
+        # Generation host stays on runtime, catalog fetch went to the AWS host.
+        assert "runtime." in auth_manager.api_host
+        assert mock_client.request_with_retry.await_args.kwargs["url"].startswith(
+            "https://q.us-east-1.amazonaws.com"
+        )

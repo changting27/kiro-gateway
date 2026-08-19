@@ -4321,3 +4321,31 @@ class TestKiroAuthManagerTlsVerification:
             await manager._refresh_token_aws_sso_oidc()
 
             assert mock_client_class.call_args.kwargs.get("verify") is auth.SSL_VERIFY
+
+
+class TestKiroAuthManagerModelsHost:
+    """Tests for the models_host property (ListAvailableModels host)."""
+
+    def test_models_host_is_aws_q_host_for_region(self):
+        """
+        What it does: Verifies models_host resolves to q.{api_region}.amazonaws.com.
+        Purpose: The model-catalog fetch must target the AWS Q host, which is the only
+                 host that serves ListAvailableModels.
+        """
+        manager = KiroAuthManager(refresh_token="test_token", region="us-east-1")
+        print(f"models_host: {manager.models_host}")
+        assert manager.models_host == "https://q.us-east-1.amazonaws.com"
+
+    def test_models_host_distinct_from_generation_and_mcp_hosts(self):
+        """
+        What it does: Verifies models_host differs from api_host (generation) and
+                      q_host (/mcp), which both stay on the runtime host.
+        Purpose: Fetching the catalog from the AWS host must not move generation or MCP.
+        """
+        manager = KiroAuthManager(refresh_token="test_token", region="us-east-1")
+        print(f"api_host={manager.api_host} q_host={manager.q_host} models_host={manager.models_host}")
+        assert "runtime." in manager.api_host
+        assert "runtime." in manager.q_host
+        assert manager.models_host == "https://q.us-east-1.amazonaws.com"
+        assert manager.models_host != manager.api_host
+        assert manager.models_host != manager.q_host
