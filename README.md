@@ -789,6 +789,29 @@ OBSERVABILITY_ENABLED=false
 
 ## 🔧 Troubleshooting
 
+### Transient `INVALID_MODEL_ID` errors
+
+Kiro may intermittently return HTTP 400 with `reason: INVALID_MODEL_ID` for a
+model that succeeds on a subsequent identical request. The gateway automatically
+retries only this exact structured error across OpenAI Chat, OpenAI Responses, and
+Anthropic Messages, in both streaming and non-streaming modes. Other HTTP 400
+responses are returned immediately.
+
+The default is four total attempts with exponential backoff, bounded jitter, and
+no token refresh or credential mutation. Advanced deployments can tune it in
+`.env`:
+
+```env
+INVALID_MODEL_MAX_RETRIES=4
+INVALID_MODEL_BASE_RETRY_DELAY=1.0
+INVALID_MODEL_MAX_RETRY_DELAY=8.0
+INVALID_MODEL_RETRY_JITTER_RATIO=0.25
+```
+
+A genuinely unavailable model still returns the original Kiro 400 after the
+bounded retry budget is exhausted, preserving existing error handling and
+multi-account failover.
+
 ### Connection Issues
 
 **Error: "Name or service not known" or DNS resolution failed**

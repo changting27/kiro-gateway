@@ -522,6 +522,32 @@ class TestKiroCliDbFileConfig:
             assert str(path) == config_module.KIRO_CLI_DB_FILE
 
 
+class TestInvalidModelRetryConfig:
+    """Tests for transient INVALID_MODEL_ID retry configuration."""
+
+    def test_invalid_model_retry_configuration_is_bounded(self) -> None:
+        """What it does: validates types and safety bounds for retry settings.
+
+        Purpose: Prevent invalid settings from creating zero-attempt loops,
+        negative delays, jitter above 100%, or an ineffective maximum delay.
+        """
+        from kiro.config import (
+            INVALID_MODEL_BASE_RETRY_DELAY,
+            INVALID_MODEL_MAX_RETRIES,
+            INVALID_MODEL_MAX_RETRY_DELAY,
+            INVALID_MODEL_RETRY_JITTER_RATIO,
+        )
+
+        assert isinstance(INVALID_MODEL_MAX_RETRIES, int)
+        assert INVALID_MODEL_MAX_RETRIES >= 1
+        assert isinstance(INVALID_MODEL_BASE_RETRY_DELAY, float)
+        assert INVALID_MODEL_BASE_RETRY_DELAY >= 0.0
+        assert isinstance(INVALID_MODEL_MAX_RETRY_DELAY, float)
+        assert INVALID_MODEL_MAX_RETRY_DELAY >= INVALID_MODEL_BASE_RETRY_DELAY
+        assert isinstance(INVALID_MODEL_RETRY_JITTER_RATIO, float)
+        assert 0.0 <= INVALID_MODEL_RETRY_JITTER_RATIO <= 1.0
+
+
 class TestFallbackModelsConfig:
     """Tests for FALLBACK_MODELS configuration."""
     

@@ -365,12 +365,21 @@ Automatic error handling with exponential backoff:
 
 | Error Code | Action |
 |------------|--------|
+| `400` + `INVALID_MODEL_ID` | Bounded exponential backoff with jitter; returns final original 400 after exhaustion |
+| Other `400` | Return immediately without retry |
 | `403` | Token refresh via `force_refresh()` + retry |
 | `429` | Exponential backoff: `BASE_RETRY_DELAY * (2 ** attempt)` |
 | `5xx` | Exponential backoff (up to MAX_RETRIES attempts) |
 | Timeout | Exponential backoff |
 
-**Delay formula:** `1s, 2s, 4s` (with `BASE_RETRY_DELAY=1.0`)
+For `INVALID_MODEL_ID`, the default is four total attempts with approximately
+`1s, 2s, 4s` delays plus bounded jitter. This handles a Kiro upstream quirk where
+valid models can intermittently receive that reason. Retries do not refresh or
+mutate credentials. Configure with `INVALID_MODEL_MAX_RETRIES`,
+`INVALID_MODEL_BASE_RETRY_DELAY`, `INVALID_MODEL_MAX_RETRY_DELAY`, and
+`INVALID_MODEL_RETRY_JITTER_RATIO`.
+
+**General delay formula:** `1s, 2s, 4s` (with `BASE_RETRY_DELAY=1.0`)
 
 **Methods:**
 - `request_with_retry(method, url, json_data, stream)` — request with retry

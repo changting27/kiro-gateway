@@ -265,6 +265,28 @@ MAX_RETRIES: int = 3
 # Uses exponential backoff: delay * (2 ** attempt)
 BASE_RETRY_DELAY: float = 1.0
 
+# Kiro occasionally returns HTTP 400 + INVALID_MODEL_ID for a valid model during
+# transient upstream availability windows. Retry only that exact structured error;
+# all other 400 responses still return immediately.
+#
+# This is the TOTAL number of attempts, including the initial request. Four attempts
+# wait roughly 1s, 2s, and 4s before retries. Bounded jitter prevents concurrent
+# gateway requests from retrying in lockstep.
+INVALID_MODEL_MAX_RETRIES: int = max(
+    1, int(os.getenv("INVALID_MODEL_MAX_RETRIES", "4"))
+)
+INVALID_MODEL_BASE_RETRY_DELAY: float = max(
+    0.0, float(os.getenv("INVALID_MODEL_BASE_RETRY_DELAY", "1.0"))
+)
+INVALID_MODEL_MAX_RETRY_DELAY: float = max(
+    INVALID_MODEL_BASE_RETRY_DELAY,
+    float(os.getenv("INVALID_MODEL_MAX_RETRY_DELAY", "8.0")),
+)
+INVALID_MODEL_RETRY_JITTER_RATIO: float = max(
+    0.0,
+    min(1.0, float(os.getenv("INVALID_MODEL_RETRY_JITTER_RATIO", "0.25"))),
+)
+
 # ==================================================================================================
 # Hidden Models Configuration
 # ==================================================================================================

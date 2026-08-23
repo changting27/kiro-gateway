@@ -16,7 +16,16 @@ from fastapi import HTTPException
 
 from kiro.http_client import KiroHttpClient
 from kiro.auth import KiroAuthManager
-from kiro.config import MAX_RETRIES, BASE_RETRY_DELAY, FIRST_TOKEN_MAX_RETRIES, STREAMING_READ_TIMEOUT
+from kiro.config import (
+    BASE_RETRY_DELAY,
+    FIRST_TOKEN_MAX_RETRIES,
+    INVALID_MODEL_BASE_RETRY_DELAY,
+    INVALID_MODEL_MAX_RETRIES,
+    INVALID_MODEL_MAX_RETRY_DELAY,
+    INVALID_MODEL_RETRY_JITTER_RATIO,
+    MAX_RETRIES,
+    STREAMING_READ_TIMEOUT,
+)
 
 
 @pytest.fixture
@@ -469,6 +478,227 @@ class TestKiroHttpClientRequestWithRetry:
         mock_client.build_request.assert_called_once()
         mock_client.send.assert_called_once_with(mock_request, stream=True)
         assert response.status_code == 200
+
+
+class TestKiroHttpClientInvalidModelRetry:
+    """Tests for transient Kiro INVALID_MODEL_ID retry handling."""
+
+    @staticmethod
+    def _response(status_code: int, body: object = None) -> AsyncMock:
+        """Build a mock HTTP response with deterministic bytes.
+
+        Args:
+            status_code: HTTP status returned by Kiro.
+            body: JSON-compatible body or raw bytes.
+
+        Returns:
+            Async response mock with ``aread`` and ``aclose`` configured.
+        """
+        response = AsyncMock(spec=httpx.Response)
+        response.status_code = status_code
+        if isinstance(body, bytes):
+            content = body
+        elif body is None:
+            content = b""
+        else:
+            content = json.dumps(body).encode("utf-8")
+        response.aread = AsyncMock(return_value=content)
+        response.aclose = AsyncMock()
+        return response
+
+    @pytest.mark.asyncio
+    async def test_transient_invalid_model_recovers_without_refresh(
+        self, mock_auth_manager_for_http
+    ) -> None:
+        """What it does: retries one structured INVALID_MODEL_ID then succeeds.
+
+        Purpose: Recover transient Kiro model-routing failures without changing
+        credentials or refreshing the access token.
+        """
+        invalid = self._response(
+            400,
+            {
+                "message": "Invalid model ID. Please select a different model to continue.",
+                "reason": "INVALID_MODEL_ID",
+            },
+        )
+        success = self._response(200)
+        mock_client = AsyncMock()
+        mock_client.request = AsyncMock(side_effect=[invalid, success])
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+
+        with patch.object(http_client, "_get_client", return_value=mock_client):
+            with patch("kiro.http_client.get_kiro_headers", return_value={}):
+                with patch("kiro.http_client.random.uniform", return_value=0.0):
+                    with patch(
+                        "kiro.http_client.asyncio.sleep", new_callable=AsyncMock
+                    ) as sleep:
+                        response = await http_client.request_with_retry(
+                            "POST", "https://api.example.com/generate", {"model": "valid"}
+                        )
+
+        assert response is success
+        assert mock_client.request.call_count == 2
+        sleep.assert_awaited_once_with(INVALID_MODEL_BASE_RETRY_DELAY)
+        invalid.aclose.assert_awaited_once()
+        mock_auth_manager_for_http.force_refresh.assert_not_awaited()
+        assert mock_auth_manager_for_http.get_access_token.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_streaming_invalid_model_closes_response_before_retry(
+        self, mock_auth_manager_for_http
+    ) -> None:
+        """What it does: retries a streaming 400 using a fresh built request.
+
+        Purpose: Ensure the shared fix covers streaming surfaces and closes the
+        failed response so retries cannot leak CLOSE_WAIT connections.
+        """
+        invalid = self._response(400, {"reason": "INVALID_MODEL_ID"})
+        success = self._response(200)
+        request_one = Mock()
+        request_two = Mock()
+        mock_client = AsyncMock()
+        mock_client.build_request = Mock(side_effect=[request_one, request_two])
+        mock_client.send = AsyncMock(side_effect=[invalid, success])
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+
+        with patch.object(http_client, "_get_client", return_value=mock_client):
+            with patch("kiro.http_client.get_kiro_headers", return_value={}):
+                with patch("kiro.http_client.random.uniform", return_value=0.0):
+                    with patch(
+                        "kiro.http_client.asyncio.sleep", new_callable=AsyncMock
+                    ):
+                        response = await http_client.request_with_retry(
+                            "POST",
+                            "https://api.example.com/generate",
+                            {"model": "valid"},
+                            stream=True,
+                        )
+
+        assert response is success
+        assert mock_client.build_request.call_count == 2
+        assert mock_client.send.await_count == 2
+        mock_client.send.assert_any_await(request_one, stream=True)
+        mock_client.send.assert_any_await(request_two, stream=True)
+        invalid.aread.assert_awaited_once()
+        invalid.aclose.assert_awaited_once()
+        success.aclose.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_invalid_model_exhaustion_returns_final_original_response(
+        self, mock_auth_manager_for_http
+    ) -> None:
+        """What it does: exhausts the dedicated budget on a truly invalid model.
+
+        Purpose: Preserve existing route error shaping and account failover while
+        proving the retry loop is strictly bounded.
+        """
+        responses = [
+            self._response(
+                400,
+                {"message": f"invalid-{index}", "reason": "INVALID_MODEL_ID"},
+            )
+            for index in range(INVALID_MODEL_MAX_RETRIES)
+        ]
+        mock_client = AsyncMock()
+        mock_client.request = AsyncMock(side_effect=responses)
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+
+        delays = []
+
+        async def capture_sleep(delay: float) -> None:
+            delays.append(delay)
+
+        with patch.object(http_client, "_get_client", return_value=mock_client):
+            with patch("kiro.http_client.get_kiro_headers", return_value={}):
+                with patch("kiro.http_client.random.uniform", return_value=0.0):
+                    with patch(
+                        "kiro.http_client.asyncio.sleep", side_effect=capture_sleep
+                    ):
+                        response = await http_client.request_with_retry(
+                            "POST", "https://api.example.com/generate", {"model": "bad"}
+                        )
+
+        assert response is responses[-1]
+        assert mock_client.request.await_count == INVALID_MODEL_MAX_RETRIES
+        assert delays == [
+            min(
+                INVALID_MODEL_BASE_RETRY_DELAY * (2 ** attempt),
+                INVALID_MODEL_MAX_RETRY_DELAY,
+            )
+            for attempt in range(INVALID_MODEL_MAX_RETRIES - 1)
+        ]
+        for discarded in responses[:-1]:
+            discarded.aclose.assert_awaited_once()
+        responses[-1].aclose.assert_not_awaited()
+        mock_auth_manager_for_http.force_refresh.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "body",
+        [
+            {"reason": "CONTENT_LENGTH_EXCEEDS_THRESHOLD"},
+            {"reason": "INVALID_MODEL"},
+            {"reason": 123},
+            {"error": {"reason": "INVALID_MODEL_ID"}},
+            ["INVALID_MODEL_ID"],
+            b"not-json",
+            b"",
+        ],
+        ids=[
+            "context-overflow",
+            "different-reason",
+            "non-string-reason",
+            "nested-reason",
+            "json-array",
+            "malformed-json",
+            "empty-body",
+        ],
+    )
+    async def test_other_400_responses_are_not_retried(
+        self, mock_auth_manager_for_http, body: object
+    ) -> None:
+        """What it does: returns every non-matching 400 immediately.
+
+        Purpose: Avoid masking malformed requests and prevent accidental broad
+        retries based on message text or malformed upstream data.
+        """
+        error = self._response(400, body)
+        mock_client = AsyncMock()
+        mock_client.request = AsyncMock(return_value=error)
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+
+        with patch.object(http_client, "_get_client", return_value=mock_client):
+            with patch("kiro.http_client.get_kiro_headers", return_value={}):
+                with patch(
+                    "kiro.http_client.asyncio.sleep", new_callable=AsyncMock
+                ) as sleep:
+                    response = await http_client.request_with_retry(
+                        "POST", "https://api.example.com/generate", {"model": "test"}
+                    )
+
+        assert response is error
+        mock_client.request.assert_awaited_once()
+        sleep.assert_not_awaited()
+        error.aclose.assert_not_awaited()
+        mock_auth_manager_for_http.force_refresh.assert_not_awaited()
+
+    def test_invalid_model_retry_delay_is_jittered_and_bounded(self) -> None:
+        """What it does: verifies additive jitter never exceeds the configured cap.
+
+        Purpose: Desynchronize concurrent retries without permitting unbounded
+        latency.
+        """
+        uncapped = min(
+            INVALID_MODEL_BASE_RETRY_DELAY * (2 ** 20),
+            INVALID_MODEL_MAX_RETRY_DELAY,
+        )
+        jitter_limit = uncapped * INVALID_MODEL_RETRY_JITTER_RATIO
+
+        with patch("kiro.http_client.random.uniform", return_value=jitter_limit):
+            delay = KiroHttpClient._invalid_model_retry_delay(20)
+
+        assert delay == INVALID_MODEL_MAX_RETRY_DELAY
 
 
 class TestKiroHttpClientContextManager:
