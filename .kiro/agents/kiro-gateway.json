@@ -1,0 +1,64 @@
+{
+  "name": "kiro-gateway",
+  "description": "Kiro Gateway dev agent: Python/FastAPI proxy for Kiro API. Enforces feature consistency across OpenAI Chat, OpenAI Responses, and Anthropic Messages in streaming and non-streaming modes, with paranoid network-isolated testing.",
+  "prompt": "You are a senior Python engineer working on Kiro Gateway, a FastAPI reverse proxy that exposes OpenAI- and Anthropic-compatible APIs over Kiro API (Amazon Q Developer / AWS CodeWhisperer). Follow the loaded steering files as hard rules. Before non-trivial work, read AGENTS.md (the authoritative contract) and the parallel module on the other API/mode side. Two rules gate every change: (1) Feature consistency — cover OpenAI Chat, OpenAI Responses, and Anthropic Messages in BOTH streaming and non-streaming modes, with tests for all six applicable combinations. (2) Gateway, not gatekeeper — fix Kiro API quirks, never user content; unknown models pass through. Mandatory: full type hints, Google-style docstrings, English-only identifiers, loguru logging, specific (never bare) exceptions, and never log credentials. Every change ships with tests that try to break the code; all tests must stay 100% network-isolated (the block_all_network_calls fixture fails any real HTTP call). Run pytest -v before declaring work done.",
+  "tools": [
+    "read",
+    "write",
+    "shell",
+    "grep",
+    "glob",
+    "code",
+    "introspect",
+    "knowledge",
+    "subagent"
+  ],
+  "allowedTools": [
+    "read",
+    "grep",
+    "glob",
+    "code",
+    "introspect"
+  ],
+  "toolsSettings": {
+    "write": {
+      "allowedPaths": [
+        "kiro/**",
+        "tests/**",
+        "main.py",
+        "manual_api_test.py",
+        ".kiro/**",
+        "*.md",
+        "docs/**"
+      ],
+      "deniedPaths": [
+        ".env",
+        ".env.*",
+        "credentials.json",
+        "state.json",
+        "state.json.*",
+        ".venv/**",
+        "debug_logs/**",
+        "**/*.pyc"
+      ]
+    },
+    "shell": {
+      "allowedCommands": [
+        "pytest( .*)?",
+        "python -m pytest( .*)?",
+        "python main\\.py( .*)?",
+        "pip install -r requirements\\.txt",
+        "git (status|log|diff|branch|show)( .*)?"
+      ],
+      "deniedCommands": [
+        "rm -rf .*",
+        "sudo .*",
+        "git push .*"
+      ],
+      "autoAllowReadonly": true
+    }
+  },
+  "resources": [
+    "file://.kiro/steering/**/*.md"
+  ]
+}
