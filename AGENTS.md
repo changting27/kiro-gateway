@@ -96,6 +96,10 @@ Use a per-request `httpx.AsyncClient` for streaming requests to prevent `CLOSE_W
 
 All outbound HTTP clients must honor the central proxy and TLS verification configuration. `KIRO_EXTRA_CA_CERTS` references a local PEM file and augments trust only for this process. Never embed or commit a real corporate root CA, private key, credential, employee identity, or local certificate path.
 
+### Generation request URL
+
+Build every GenerateAssistantResponse URL with `config.get_kiro_generate_assistant_response_url()`. The default is the canonical AWS JSON 1.0 form `POST {runtime_host}/` with the operation in `x-amz-target`, matching official Kiro clients. Path-allow-listing proxies can reject the legacy `/generateAssistantResponse` alias with an HTML 404 that clients misreport as a missing model. Never hardcode the path in routes; operators can override it only through `KIRO_GENERATE_ASSISTANT_RESPONSE_PATH`.
+
 ### Model resolution
 
 Normalize model names before resolution. Minor-version dashes become dots and date suffixes are stripped, for example `claude-haiku-4-5-20251001` becomes `claude-haiku-4.5`. Unknown models pass through to Kiro.

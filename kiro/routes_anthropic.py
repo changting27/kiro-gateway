@@ -35,7 +35,11 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
 from loguru import logger
 
-from kiro.config import PROXY_API_KEY, PROFILE_ARN
+from kiro.config import (
+    PROXY_API_KEY,
+    PROFILE_ARN,
+    get_kiro_generate_assistant_response_url,
+)
 from kiro.models_anthropic import (
     AnthropicMessagesRequest,
     AnthropicCountTokensRequest,
@@ -461,7 +465,7 @@ async def messages(
                 logger.warning(f"Failed to log Kiro request: {e}")
             
             # Create HTTP client
-            url = f"{auth_manager.api_host}/generateAssistantResponse"
+            url = get_kiro_generate_assistant_response_url(auth_manager.api_host)
             logger.debug(f"Kiro API URL: {url} (account: {account.id})")
             
             if request_data.stream:
@@ -783,7 +787,7 @@ async def messages(
     # Create HTTP client with retry logic
     # For streaming: use per-request client to avoid CLOSE_WAIT leak on VPN disconnect (issue #54)
     # For non-streaming: use shared client for connection pooling
-    url = f"{auth_manager.api_host}/generateAssistantResponse"
+    url = get_kiro_generate_assistant_response_url(auth_manager.api_host)
     logger.debug(f"Kiro API URL: {url}")
     
     if request_data.stream:

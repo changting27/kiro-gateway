@@ -458,7 +458,8 @@ prompt_tokens = total_tokens - completion_tokens            (вычитание)
 
 *   **Token Refresh:** `POST https://prod.{region}.auth.desktop.kiro.dev/refreshToken`
 *   **List Models:** `GET https://q.{region}.amazonaws.com/ListAvailableModels`
-*   **Generate Response:** `POST https://codewhisperer.{region}.amazonaws.com/generateAssistantResponse`
+*   **Generate Response:** `POST https://runtime.{region}.kiro.dev/` с заголовком `x-amz-target: AmazonCodeWhispererStreamingService.GenerateAssistantResponse` (путь настраивается через `KIRO_GENERATE_ASSISTANT_RESPONSE_PATH`; устаревший алиас `/generateAssistantResponse` отклоняется некоторыми прокси с белым списком путей)
+*   **MCP tools (web_search):** `POST https://runtime.{region}.kiro.dev/mcp`
 
 ## 4. Детальный Поток Данных
 
@@ -511,7 +512,7 @@ prompt_tokens = total_tokens - completion_tokens            (вычитание)
 │  └────────┬────────┘  └────────┬────────┘  └─────────────────┘ │
 └───────────┼────────────────────┼────────────────────────────────┘
             │                    │
-            │                    │ POST /generateAssistantResponse
+            │                    │ POST / (x-amz-target)
             │                    ▼
             │         ┌─────────────────────────────────────────┐
             │         │              Kiro API                   │

@@ -1170,3 +1170,193 @@ class TestFallbackModelsLatestCatalog:
 
         ids = [m["modelId"] for m in FALLBACK_MODELS]
         assert len(ids) == len(set(ids)), "Duplicate modelId in FALLBACK_MODELS"
+
+
+class TestGenerateAssistantResponsePathConfig:
+    """Tests for KIRO_GENERATE_ASSISTANT_RESPONSE_PATH and the generation URL builder.
+
+    Regression context: path-allow-listing proxies in front of the runtime host
+    reject the legacy ``/generateAssistantResponse`` alias with an HTML 404 while
+    forwarding the canonical AWS JSON 1.0 request ``POST /``.
+    """
+
+    @staticmethod
+    def _reload_with_path(value):
+        """Reload kiro.config with KIRO_GENERATE_ASSISTANT_RESPONSE_PATH mocked.
+
+        Args:
+            value: Value returned by os.getenv for the setting (None = unset).
+
+        Returns:
+            The reloaded kiro.config module.
+        """
+        import importlib
+        import kiro.config as config_module
+
+        original_getenv = os.getenv
+
+        def mock_getenv(key, default=None):
+            if key == "KIRO_GENERATE_ASSISTANT_RESPONSE_PATH":
+                return default if value is None else value
+            return original_getenv(key, default)
+
+        with patch.object(os, "getenv", side_effect=mock_getenv):
+            importlib.reload(config_module)
+        return config_module
+
+    @staticmethod
+    def _restore_config():
+        """Reload kiro.config with the real environment."""
+        import importlib
+        import kiro.config as config_module
+
+        importlib.reload(config_module)
+
+    def test_default_path_is_canonical_root(self):
+        """
+        What it does: Verifies the unset setting defaults to the canonical "/".
+        Purpose: Default generation requests must use POST / (x-amz-target protocol).
+        """
+        try:
+            config_module = self._reload_with_path(None)
+            assert config_module.KIRO_GENERATE_ASSISTANT_RESPONSE_PATH == "/"
+            assert (
+                config_module.get_kiro_generate_assistant_response_url(
+                    "https://runtime.us-east-1.kiro.dev"
+                )
+                == "https://runtime.us-east-1.kiro.dev/"
+            )
+        finally:
+            self._restore_config()
+
+    def test_environment_override_restores_legacy_path(self):
+        """
+        What it does: Verifies the env var can restore the legacy REST alias.
+        Purpose: Operators on network paths that require the alias keep a recovery knob.
+        """
+        try:
+            config_module = self._reload_with_path("/generateAssistantResponse")
+            assert (
+                config_module.get_kiro_generate_assistant_response_url(
+                    "https://runtime.us-east-1.kiro.dev"
+                )
+                == "https://runtime.us-east-1.kiro.dev/generateAssistantResponse"
+            )
+        finally:
+            self._restore_config()
+
+    def test_invalid_environment_value_fails_fast_on_import(self):
+        """
+        What it does: Verifies an injected host in the env var aborts config loading.
+        Purpose: A misconfigured path must never silently redirect authenticated traffic.
+        """
+        try:
+            with pytest.raises(ValueError, match="KIRO_GENERATE_ASSISTANT_RESPONSE_PATH"):
+                self._reload_with_path("https://attacker.example.com/")
+        finally:
+            self._restore_config()
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            (None, "/"),
+            ("", "/"),
+            ("   ", "/"),
+            ("/", "/"),
+            (" / ", "/"),
+            ("generateAssistantResponse", "/generateAssistantResponse"),
+            ("/generateAssistantResponse", "/generateAssistantResponse"),
+            ("  /generateAssistantResponse  ", "/generateAssistantResponse"),
+        ],
+    )
+    def test_normalize_accepts_valid_paths(self, raw, expected):
+        """
+        What it does: Verifies blank, slash-less, and padded values normalize correctly.
+        Purpose: Common operator typos must still produce a valid single-slash path.
+        """
+        from kiro.config import _normalize_generate_assistant_response_path
+
+        assert _normalize_generate_assistant_response_path(raw) == expected
+
+    @pytest.mark.parametrize(
+        "raw",
+        [None, "/", "generateAssistantResponse", "/generateAssistantResponse", "/a/b-c_d.e~f"],
+    )
+    def test_accepted_paths_build_urls_httpx_can_send(self, raw):
+        """
+        What it does: Verifies every accepted path yields a URL httpx accepts unchanged.
+        Purpose: Anything config validation lets through must not fail later at
+                 request time with InvalidURL or be silently rewritten.
+        """
+        import httpx
+        from kiro.config import _normalize_generate_assistant_response_path
+
+        path = _normalize_generate_assistant_response_path(raw)
+        url = f"https://runtime.us-east-1.kiro.dev{path}"
+        request = httpx.Request("POST", url)
+        assert request.url.host == "runtime.us-east-1.kiro.dev"
+        assert request.url.raw_path.decode("ascii") == path
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "https://evil.example.com/",
+            "http://runtime.us-east-1.kiro.dev/",
+            "//evil.example.com/",
+            "/?operation=x",
+            "/#fragment",
+            "/generate Assistant",
+            "/path\r\nX-Injected: 1",
+            "\\evil",
+            "/a\x00b",
+            "/a\x01b",
+            "/a\x1fb",
+            "/a\x7fb",
+            "/a\tb",
+        ],
+    )
+    def test_normalize_rejects_unsafe_values(self, raw):
+        """
+        What it does: Verifies scheme, authority, query, fragment, whitespace, and
+                      backslash injections are rejected.
+        Purpose: The path is appended to an authenticated host; it must not be able
+                 to change the destination or smuggle header data.
+        """
+        from kiro.config import _normalize_generate_assistant_response_path
+
+        with pytest.raises(ValueError, match="KIRO_GENERATE_ASSISTANT_RESPONSE_PATH"):
+            _normalize_generate_assistant_response_path(raw)
+
+    @pytest.mark.parametrize(
+        "host",
+        [
+            "https://runtime.us-east-1.kiro.dev",
+            "https://runtime.us-east-1.kiro.dev/",
+            "https://runtime.us-east-1.kiro.dev//",
+        ],
+    )
+    def test_url_builder_never_doubles_slashes(self, host):
+        """
+        What it does: Verifies trailing slashes on the host are collapsed.
+        Purpose: "host//" would be a different path that proxies may also reject.
+        """
+        from kiro.config import get_kiro_generate_assistant_response_url
+
+        assert (
+            get_kiro_generate_assistant_response_url(host)
+            == "https://runtime.us-east-1.kiro.dev/"
+        )
+
+    def test_auth_manager_api_host_produces_canonical_url(self):
+        """
+        What it does: Verifies the real auth-manager host feeds the builder correctly.
+        Purpose: Guards the integration point used by every generation route.
+        """
+        from kiro.auth import KiroAuthManager
+        from kiro.config import get_kiro_generate_assistant_response_url
+
+        manager = KiroAuthManager(refresh_token="test_refresh_token", region="us-east-1")
+        assert (
+            get_kiro_generate_assistant_response_url(manager.api_host)
+            == "https://runtime.us-east-1.kiro.dev/"
+        )

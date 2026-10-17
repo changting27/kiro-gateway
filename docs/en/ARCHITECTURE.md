@@ -467,7 +467,8 @@ All URLs are dynamically formed based on the region:
 
 *   **Token Refresh:** `POST https://prod.{region}.auth.desktop.kiro.dev/refreshToken`
 *   **List Models:** `GET https://q.{region}.amazonaws.com/ListAvailableModels`
-*   **Generate Response:** `POST https://codewhisperer.{region}.amazonaws.com/generateAssistantResponse`
+*   **Generate Response:** `POST https://runtime.{region}.kiro.dev/` with `x-amz-target: AmazonCodeWhispererStreamingService.GenerateAssistantResponse` (path configurable via `KIRO_GENERATE_ASSISTANT_RESPONSE_PATH`; the legacy `/generateAssistantResponse` alias is rejected by some path-allow-listing proxies)
+*   **MCP tools (web_search):** `POST https://runtime.{region}.kiro.dev/mcp`
 
 ## 4. Detailed Data Flow
 
@@ -520,7 +521,7 @@ All URLs are dynamically formed based on the region:
 │  └────────┬────────┘  └────────┬────────┘  └─────────────────┘ │
 └───────────┼────────────────────┼────────────────────────────────┘
             │                    │
-            │                    │ POST /generateAssistantResponse
+            │                    │ POST / (x-amz-target)
             │                    ▼
             │         ┌─────────────────────────────────────┐
             │         │              Kiro API                   │

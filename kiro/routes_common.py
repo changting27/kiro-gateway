@@ -50,7 +50,7 @@ from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from loguru import logger
 
-from kiro.config import PROFILE_ARN
+from kiro.config import PROFILE_ARN, get_kiro_generate_assistant_response_url
 from kiro.http_client import KiroHttpClient
 from kiro.streaming_core import collect_nonstreaming_with_retry
 from kiro.utils import generate_conversation_id
@@ -89,7 +89,10 @@ ErrorResponseBuilder = Callable[[Any, int, int], Tuple[int, Dict[str, Any]]]
 
 def _build_kiro_url(auth_manager: Any) -> str:
     """
-    Build the Kiro generateAssistantResponse URL for an account's auth manager.
+    Build the Kiro GenerateAssistantResponse URL for an account's auth manager.
+
+    Delegates to :func:`kiro.config.get_kiro_generate_assistant_response_url` so
+    every API surface uses the same configured request path.
 
     Args:
         auth_manager: The account's KiroAuthManager (provides ``api_host``).
@@ -97,7 +100,7 @@ def _build_kiro_url(auth_manager: Any) -> str:
     Returns:
         Fully-qualified endpoint URL.
     """
-    return f"{auth_manager.api_host}/generateAssistantResponse"
+    return get_kiro_generate_assistant_response_url(auth_manager.api_host)
 
 
 async def _read_error_text(response: httpx.Response) -> str:

@@ -57,6 +57,21 @@ both streaming and non-streaming modes. Other 400 responses return immediately.
 - Credential and kiro-cli auth-row content fingerprints remained unchanged.
 - A real upstream rejection window can exceed four attempts; bounded exhaustion
   deliberately returns the final 400. Operators may tune the retry budget.
+- Persistent `INVALID_MODEL_ID` for **every** Claude model is not transient: it
+  indicates a different network egress (e.g. DNS bypassing the corporate
+  `*.kiro.dev` route) whose catalog lacks Claude. Raising the retry budget does
+  not help; fix the network path instead.
+
+## Generation request path (2026-10-17)
+
+- Generation requests use `POST {runtime_host}/` (operation in `x-amz-target`)
+  via `config.get_kiro_generate_assistant_response_url()`; override with
+  `KIRO_GENERATE_ASSISTANT_RESPONSE_PATH`. A path-allow-listing proxy in front of
+  `runtime.{region}.kiro.dev` returned an `openresty` HTML 404 for the legacy
+  `/generateAssistantResponse` alias, which Claude Code reported as a missing model.
+- Coverage: `tests/integration/test_generate_assistant_response_url_flow.py`
+  (3 surfaces × stream/non-stream × legacy/account-system, plus override) and
+  `TestGenerateAssistantResponsePathConfig` in `tests/unit/test_config.py`.
 
 ## Common commands
 

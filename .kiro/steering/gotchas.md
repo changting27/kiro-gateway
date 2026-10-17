@@ -27,6 +27,12 @@
   original response without closing it so route error shaping and existing
   multi-account classification can read it. A true invalid model, or a transient
   window longer than the budget, must finish with a bounded 400.
+- **Generation uses `POST {runtime_host}/`, not `/generateAssistantResponse`.**
+  The operation is selected by `x-amz-target`. Path-allow-listing proxies reject
+  the legacy alias with an HTML 404 that clients misreport as a missing model.
+  Build every generation URL via `config.get_kiro_generate_assistant_response_url()`;
+  never hardcode the path in routes. Override only via
+  `KIRO_GENERATE_ASSISTANT_RESPONSE_PATH`.
 - **Model-name normalization** (`model_resolver.normalize_model_name`): minor
   version dashes become dots and date suffixes are stripped, e.g.
   `claude-haiku-4-5-20251001` → `claude-haiku-4.5` before resolution.

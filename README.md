@@ -812,6 +812,24 @@ A genuinely unavailable model still returns the original Kiro 400 after the
 bounded retry budget is exhausted, preserving existing error handling and
 multi-account failover.
 
+### "Model may not exist" with an HTML 404 from upstream
+
+If clients such as Claude Code report that a model does not exist while
+`/v1/models` lists it, and `debug_logs/error_info.json` shows an HTML
+`404 Not Found` (for example from `openresty`) instead of an AWS JSON error, a
+proxy on your network path is rejecting the request path. The gateway sends
+generation requests to the canonical `POST https://runtime.{region}.kiro.dev/`
+with the operation in the `x-amz-target` header, matching official Kiro
+clients. Only if your network specifically requires the legacy REST alias,
+override it:
+
+```env
+KIRO_GENERATE_ASSISTANT_RESPONSE_PATH="/generateAssistantResponse"
+```
+
+Do not bypass your network's DNS for `*.kiro.dev` to fix this: a different
+egress path can expose a different model catalog.
+
 ### Connection Issues
 
 **Error: "Name or service not known" or DNS resolution failed**

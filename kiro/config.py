@@ -246,6 +246,59 @@ KIRO_Q_HOST_TEMPLATE: str = "https://runtime.{region}.kiro.dev"
 # reachable in a given region, the model fetch falls back to FALLBACK_MODELS.
 KIRO_MODELS_HOST_TEMPLATE: str = "https://q.{region}.amazonaws.com"
 
+# Request path for the GenerateAssistantResponse operation on the runtime host.
+#
+# The runtime service speaks the AWS JSON 1.0 protocol: the operation is selected
+# by the ``x-amz-target`` header, so the canonical request is ``POST /``. This is
+# what the official Kiro clients send. The legacy REST-style alias
+# ``/generateAssistantResponse`` is still accepted by AWS itself, but some network
+# paths (for example, reverse proxies that allow-list request paths in front of
+# runtime.{region}.kiro.dev) reject it with a non-AWS HTML 404, which clients such
+# as Claude Code misreport as "model does not exist". Override only if a specific
+# network path requires the legacy alias.
+DEFAULT_GENERATE_ASSISTANT_RESPONSE_PATH: str = "/"
+
+# Characters that must never appear in the configured request path: anything that
+# would inject a query, fragment, or backslash, plus whitespace and ASCII control
+# characters (which httpx rejects only at request time with InvalidURL, turning a
+# config typo into an opaque 500 on every request instead of a startup error).
+_FORBIDDEN_PATH_PATTERN = re.compile(r"[\s\x00-\x1f\x7f?#\\]")
+
+
+def _normalize_generate_assistant_response_path(raw_path: Optional[str]) -> str:
+    """Normalize and validate the configured GenerateAssistantResponse path.
+
+    Args:
+        raw_path: Raw value from the environment. ``None`` or blank selects the
+            default canonical path ``/``. A missing leading slash is added.
+
+    Returns:
+        A path that starts with exactly one ``/`` and is safe to append to a host.
+
+    Raises:
+        ValueError: If the value contains a scheme/authority (``://`` or a leading
+            ``//``), whitespace or control characters, a query string, a
+            fragment, or a backslash.
+    """
+    if raw_path is None or not raw_path.strip():
+        return DEFAULT_GENERATE_ASSISTANT_RESPONSE_PATH
+
+    path = raw_path.strip()
+    if "://" in path or path.startswith("//") or _FORBIDDEN_PATH_PATTERN.search(path):
+        raise ValueError(
+            "Invalid KIRO_GENERATE_ASSISTANT_RESPONSE_PATH: expected a URL path such "
+            "as '/' or '/generateAssistantResponse' without scheme, host, query, "
+            "fragment, whitespace, or control characters."
+        )
+    if not path.startswith("/"):
+        path = f"/{path}"
+    return path
+
+
+KIRO_GENERATE_ASSISTANT_RESPONSE_PATH: str = _normalize_generate_assistant_response_path(
+    os.getenv("KIRO_GENERATE_ASSISTANT_RESPONSE_PATH")
+)
+
 # ==================================================================================================
 # Token Settings
 # ==================================================================================================
@@ -712,6 +765,24 @@ def get_aws_sso_oidc_url(region: str) -> str:
 def get_kiro_api_host(region: str) -> str:
     """Return API host for the specified region."""
     return KIRO_API_HOST_TEMPLATE.format(region=region)
+
+
+def get_kiro_generate_assistant_response_url(api_host: str) -> str:
+    """Return the fully-qualified GenerateAssistantResponse URL for an API host.
+
+    Every generation call (OpenAI Chat, OpenAI Responses, Anthropic Messages, in
+    both streaming and non-streaming modes) must build its URL here so the
+    request path stays consistent across API surfaces.
+
+    Args:
+        api_host: Runtime API host such as ``https://runtime.us-east-1.kiro.dev``.
+            A trailing slash is tolerated.
+
+    Returns:
+        The host joined with ``KIRO_GENERATE_ASSISTANT_RESPONSE_PATH`` (``/`` by
+        default), e.g. ``https://runtime.us-east-1.kiro.dev/``.
+    """
+    return f"{api_host.rstrip('/')}{KIRO_GENERATE_ASSISTANT_RESPONSE_PATH}"
 
 
 def get_kiro_q_host(region: str) -> str:
