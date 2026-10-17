@@ -31,6 +31,8 @@ requests that will fail on all accounts.
 from enum import Enum
 from typing import Optional
 
+from kiro.kiro_errors import UPSTREAM_INTERMEDIARY_REASON
+
 
 class ErrorType(Enum):
     """
@@ -60,6 +62,8 @@ def classify_error(status_code: int, reason: Optional[str]) -> ErrorType:
     - 429: Rate limit exceeded
     
     FATAL errors (return to client immediately):
+    - Any status + UPSTREAM_INTERMEDIARY: a network intermediary, not Kiro,
+      rejected the request; every account shares that network path
     - 400 + CONTENT_LENGTH_EXCEEDS_THRESHOLD: Context overflow
     - 400 + other/null reason: Malformed request
     - 422: Validation error
@@ -91,6 +95,12 @@ def classify_error(status_code: int, reason: Optional[str]) -> ErrorType:
         >>> classify_error(500, None)
         ErrorType.FATAL
     """
+    # FATAL: A network intermediary (not Kiro) produced this response. All
+    # accounts share the same network path, so failover cannot help, and the
+    # account is healthy, so it must not be penalized by the circuit breaker.
+    if reason == UPSTREAM_INTERMEDIARY_REASON:
+        return ErrorType.FATAL
+
     # RECOVERABLE: Payment required (quota/billing issues)
     # Kiro API returns 402 for MONTHLY_REQUEST_COUNT
     if status_code == 402:

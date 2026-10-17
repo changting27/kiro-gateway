@@ -33,6 +33,12 @@
   Build every generation URL via `config.get_kiro_generate_assistant_response_url()`;
   never hardcode the path in routes. Override only via
   `KIRO_GENERATE_ASSISTANT_RESPONSE_PATH`.
+- **Intermediary errors are an exact, conservative rule.** All upstream error
+  parsing goes through `kiro_errors.parse_upstream_error()`. A response is an
+  intermediary error only if it lacks `x-amzn-requestid` AND has a markup body
+  (`text/html` or leading `<`); context overflow always wins. Such errors get
+  reason `UPSTREAM_INTERMEDIARY` (always FATAL, no account penalty) and map to
+  502 except 429/5xx. Never broaden this to plain-text or JSON bodies.
 - **Model-name normalization** (`model_resolver.normalize_model_name`): minor
   version dashes become dots and date suffixes are stripped, e.g.
   `claude-haiku-4-5-20251001` → `claude-haiku-4.5` before resolution.

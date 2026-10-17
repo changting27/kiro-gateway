@@ -72,6 +72,10 @@ both streaming and non-streaming modes. Other 400 responses return immediately.
 - Coverage: `tests/integration/test_generate_assistant_response_url_flow.py`
   (3 surfaces × stream/non-stream × legacy/account-system, plus override) and
   `TestGenerateAssistantResponsePathConfig` in `tests/unit/test_config.py`.
+- Non-AWS intermediary errors (markup body, no `x-amzn-requestid`) are shaped
+  into an actionable 502 by `parse_upstream_error()` on every surface; coverage
+  in `tests/integration/test_upstream_intermediary_error_flow.py`. A non-default
+  generation path is logged at startup.
 
 ## Common commands
 

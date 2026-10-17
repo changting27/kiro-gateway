@@ -1360,3 +1360,48 @@ class TestGenerateAssistantResponsePathConfig:
             get_kiro_generate_assistant_response_url(manager.api_host)
             == "https://runtime.us-east-1.kiro.dev/"
         )
+
+
+class TestDescribeGenerateAssistantResponsePathOverride:
+    """Tests for the startup description of a non-default generation path."""
+
+    def test_default_path_returns_none(self):
+        """What it does: the canonical default produces no message.
+
+        Purpose: Avoid startup noise for the normal configuration.
+        """
+        from kiro.config import describe_generate_assistant_response_path_override
+
+        assert describe_generate_assistant_response_path_override("/") is None
+
+    def test_override_mentions_setting_and_both_paths(self):
+        """What it does: an override names the setting, value, and default.
+
+        Purpose: Operators diagnosing upstream 404s must see the override at once.
+        """
+        from kiro.config import describe_generate_assistant_response_path_override
+
+        message = describe_generate_assistant_response_path_override(
+            "/generateAssistantResponse"
+        )
+
+        assert message is not None
+        assert "KIRO_GENERATE_ASSISTANT_RESPONSE_PATH" in message
+        assert "'/generateAssistantResponse'" in message
+        assert "default '/'" in message
+
+    def test_uses_effective_configured_path_when_omitted(self):
+        """What it does: no argument falls back to the effective setting.
+
+        Purpose: The startup call site relies on the loaded configuration.
+        """
+        import kiro.config as config_module
+
+        with patch.object(
+            config_module, "KIRO_GENERATE_ASSISTANT_RESPONSE_PATH", "/custom"
+        ):
+            message = config_module.describe_generate_assistant_response_path_override()
+        assert message is not None and "'/custom'" in message
+
+        with patch.object(config_module, "KIRO_GENERATE_ASSISTANT_RESPONSE_PATH", "/"):
+            assert config_module.describe_generate_assistant_response_path_override() is None

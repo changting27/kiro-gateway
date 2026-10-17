@@ -830,6 +830,13 @@ KIRO_GENERATE_ASSISTANT_RESPONSE_PATH="/generateAssistantResponse"
 Do not bypass your network's DNS for `*.kiro.dev` to fix this: a different
 egress path can expose a different model catalog.
 
+The gateway recognizes these intermediary responses (markup body without an
+AWS `x-amzn-requestid` header) on every API surface and returns HTTP `502` with
+an explanation instead of forwarding the misleading `404`. `429` and `5xx`
+keep their status so client retry behavior is unchanged; such errors never
+trigger account failover. A non-default `KIRO_GENERATE_ASSISTANT_RESPONSE_PATH`
+is logged once at startup.
+
 ### Connection Issues
 
 **Error: "Name or service not known" or DNS resolution failed**

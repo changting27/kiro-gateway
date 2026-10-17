@@ -791,3 +791,229 @@ class TestBuildOpenAIErrorBody:
         assert body["error"]["type"] == "kiro_api_error"
         assert body["error"]["code"] == 402
         assert body["error"]["message"] == info.user_message
+
+
+# =============================================================================
+# Network-intermediary error detection
+# =============================================================================
+
+_PROXY_HTML = (
+    "<html>\r\n<head><title>404 Not Found</title></head>\r\n<body>\r\n"
+    "<center><h1>404 Not Found</h1></center>\r\n<hr><center>openresty</center>\r\n"
+    "</body>\r\n</html>\r\n"
+)
+_REQUEST_ID = {"x-amzn-requestid": "00000000-0000-0000-0000-000000000000"}
+
+
+class TestIsUpstreamIntermediaryResponse:
+    """Conservative detection: no AWS request id AND a markup body."""
+
+    @pytest.mark.parametrize(
+        ("headers", "body"),
+        [
+            ({"content-type": "text/html"}, _PROXY_HTML),
+            ({"Content-Type": "text/html; charset=utf-8"}, "not markup at all"),
+            ({}, _PROXY_HTML),
+            ({}, "   \n<!DOCTYPE html><html></html>"),
+            (None, "<html></html>"),
+        ],
+        ids=["html-ctype", "html-ctype-mixed-case", "markup-no-ctype",
+             "doctype-leading-ws", "no-headers"],
+    )
+    def test_markup_without_request_id_is_intermediary(self, headers, body):
+        """What it does: markup/HTML errors lacking an AWS request id are flagged.
+
+        Purpose: These are produced by proxies/firewalls that never forwarded
+        the request to AWS.
+        """
+        from kiro.kiro_errors import is_upstream_intermediary_response
+
+        assert is_upstream_intermediary_response(headers, body) is True
+
+    @pytest.mark.parametrize(
+        ("headers", "body"),
+        [
+            ({"content-type": "text/html", **_REQUEST_ID}, _PROXY_HTML),
+            ({"X-Amzn-RequestId": "abc", "content-type": "text/html"}, _PROXY_HTML),
+            ({}, '{"message": "Improperly formed request.", "reason": null}'),
+            ({}, "Internal Server Error"),
+            ({}, ""),
+            ({"content-type": "application/json"}, "Input is too long."),
+        ],
+        ids=["request-id", "request-id-mixed-case", "json", "plain-text",
+             "empty", "plain-text-json-ctype"],
+    )
+    def test_aws_or_non_markup_is_not_intermediary(self, headers, body):
+        """What it does: AWS-attributed or non-markup bodies are left alone.
+
+        Purpose: Never reinterpret a genuine Kiro error; keep the existing
+        plain-text handling (e.g. context-overflow fallback) intact.
+        """
+        from kiro.kiro_errors import is_upstream_intermediary_response
+
+        assert is_upstream_intermediary_response(headers, body) is False
+
+    def test_non_mapping_headers_are_ignored(self):
+        """What it does: header objects that are not mappings are treated as absent.
+
+        Purpose: Mocked or exotic transports must not crash detection or yield
+        truthy non-string header values.
+        """
+        from unittest.mock import AsyncMock
+
+        from kiro.kiro_errors import is_upstream_intermediary_response
+
+        assert is_upstream_intermediary_response(AsyncMock(), "plain") is False
+        assert is_upstream_intermediary_response(AsyncMock(), "<html>") is True
+
+    def test_non_string_header_value_is_ignored(self):
+        """What it does: a non-string request-id value does not count as present.
+
+        Purpose: Only a real header value proves AWS processed the request.
+        """
+        from kiro.kiro_errors import is_upstream_intermediary_response
+
+        assert is_upstream_intermediary_response({"x-amzn-requestid": None}, "<html>") is True
+
+
+class TestParseUpstreamError:
+    """Single entry point for every non-200 upstream response."""
+
+    def test_proxy_html_becomes_actionable_intermediary_error(self):
+        """What it does: parses the real-world proxy 404 page.
+
+        Purpose: The client message must explain the cause and fix and must not
+        contain the raw HTML; the debug snippet is whitespace-collapsed and
+        bounded.
+        """
+        from kiro.kiro_errors import UPSTREAM_INTERMEDIARY_REASON, parse_upstream_error
+
+        info = parse_upstream_error(404, {"content-type": "text/html"}, _PROXY_HTML * 20)
+
+        assert info.is_upstream_intermediary is True
+        assert info.is_context_overflow is False
+        assert info.reason == UPSTREAM_INTERMEDIARY_REASON
+        assert "network intermediary" in info.user_message
+        assert "upstream HTTP 404" in info.user_message
+        assert "KIRO_GENERATE_ASSISTANT_RESPONSE_PATH" in info.user_message
+        assert "<html" not in info.user_message
+        assert "openresty" not in info.user_message
+        assert len(info.original_message) <= 200
+        assert "\n" not in info.original_message and "\r" not in info.original_message
+
+    def test_kiro_json_error_is_unchanged(self):
+        """What it does: JSON errors go through enhance_kiro_error unchanged.
+
+        Purpose: Regression guard for every existing reason mapping.
+        """
+        from kiro.kiro_errors import parse_upstream_error
+
+        body = '{"message": "Invalid model.", "reason": "INVALID_MODEL_ID"}'
+        info = parse_upstream_error(400, {}, body)
+
+        assert info == enhance_kiro_error({"message": "Invalid model.", "reason": "INVALID_MODEL_ID"})
+        assert info.is_upstream_intermediary is False
+
+    def test_plain_text_overflow_fallback_still_fires(self):
+        """What it does: a plain-text overflow body keeps overflow detection.
+
+        Purpose: The intermediary rule must not swallow the text fallback.
+        """
+        from kiro.kiro_errors import parse_upstream_error
+
+        info = parse_upstream_error(400, {}, "Input is too long.")
+
+        assert info.is_context_overflow is True
+        assert info.is_upstream_intermediary is False
+
+    def test_markup_overflow_text_is_still_overflow(self):
+        """What it does: overflow wording wins even inside a markup body.
+
+        Purpose: Overflow drives client auto-compaction; it must never be
+        downgraded to a gateway error.
+        """
+        from kiro.kiro_errors import parse_upstream_error
+
+        info = parse_upstream_error(400, {}, "<p>Input is too long.</p>")
+
+        assert info.is_context_overflow is True
+        assert info.is_upstream_intermediary is False
+
+    @pytest.mark.parametrize("body", ["[1, 2]", '"just a string"', "42", "null"])
+    def test_non_object_json_does_not_crash(self, body):
+        """What it does: JSON that is not an object is treated as plain text.
+
+        Purpose: enhance_kiro_error expects a dict; arrays/scalars previously
+        raised AttributeError and turned into an opaque 500.
+        """
+        from kiro.kiro_errors import parse_upstream_error
+
+        info = parse_upstream_error(400, {}, body)
+
+        assert info.original_message == body
+        assert info.is_upstream_intermediary is False
+
+
+class TestResolveClientErrorStatus:
+    """Client-facing status for parsed errors."""
+
+    @pytest.mark.parametrize("status", [400, 401, 402, 403, 404, 422, 429, 500, 503])
+    def test_kiro_errors_keep_original_status(self, status):
+        """What it does: non-intermediary errors are passed through.
+
+        Purpose: The gateway must not rewrite what Kiro actually said.
+        """
+        from kiro.kiro_errors import resolve_client_error_status
+
+        info = enhance_kiro_error({"message": "x"})
+        assert resolve_client_error_status(info, status) == status
+
+    @pytest.mark.parametrize(
+        ("upstream", "expected"),
+        [(400, 502), (401, 502), (402, 502), (403, 502), (404, 502), (422, 502),
+         (429, 429), (500, 500), (502, 502), (503, 503), (504, 504)],
+    )
+    def test_intermediary_status_mapping(self, upstream, expected):
+        """What it does: maps intermediary statuses that clients would misread.
+
+        Purpose: 4xx (except 429) becomes 502; 429 and 5xx keep their retry
+        semantics.
+        """
+        from kiro.kiro_errors import parse_upstream_error, resolve_client_error_status
+
+        info = parse_upstream_error(upstream, {}, _PROXY_HTML)
+        assert resolve_client_error_status(info, upstream) == expected
+
+
+class TestErrorBodiesForIntermediary:
+    """Both envelopes use the resolved status for intermediary errors."""
+
+    def test_anthropic_body_uses_502(self):
+        """What it does: Anthropic envelope for a proxy 404.
+
+        Purpose: Claude Code must see a gateway error, not a 404.
+        """
+        from kiro.kiro_errors import parse_upstream_error
+
+        info = parse_upstream_error(404, {}, _PROXY_HTML)
+        status, body = build_anthropic_error_body(info, 404)
+
+        assert status == 502
+        assert body["type"] == "error"
+        assert body["error"]["type"] == "api_error"
+        assert body["error"]["message"] == info.user_message
+
+    def test_openai_body_code_matches_status(self):
+        """What it does: OpenAI envelope ``code`` equals the returned status.
+
+        Purpose: A body code that disagrees with the HTTP status would confuse
+        clients that read either one.
+        """
+        from kiro.kiro_errors import parse_upstream_error
+
+        info = parse_upstream_error(404, {}, _PROXY_HTML)
+        status, body = build_openai_error_body(info, 404)
+
+        assert status == 502
+        assert body["error"]["code"] == 502
+        assert body["error"]["type"] == "kiro_api_error"

@@ -299,6 +299,32 @@ KIRO_GENERATE_ASSISTANT_RESPONSE_PATH: str = _normalize_generate_assistant_respo
     os.getenv("KIRO_GENERATE_ASSISTANT_RESPONSE_PATH")
 )
 
+
+def describe_generate_assistant_response_path_override(
+    path: Optional[str] = None,
+) -> Optional[str]:
+    """Describe a non-default generation request path for startup logging.
+
+    An overridden path changes where every generation request goes, so it is
+    surfaced once at startup to make the configuration obvious when diagnosing
+    upstream 404s or "model does not exist" reports.
+
+    Args:
+        path: Path to describe. Defaults to the effective
+            ``KIRO_GENERATE_ASSISTANT_RESPONSE_PATH``.
+
+    Returns:
+        A log message when the path differs from the canonical default ``/``,
+        otherwise ``None``.
+    """
+    effective = KIRO_GENERATE_ASSISTANT_RESPONSE_PATH if path is None else path
+    if effective == DEFAULT_GENERATE_ASSISTANT_RESPONSE_PATH:
+        return None
+    return (
+        f"Generation request path overridden: KIRO_GENERATE_ASSISTANT_RESPONSE_PATH="
+        f"{effective!r} (default {DEFAULT_GENERATE_ASSISTANT_RESPONSE_PATH!r})"
+    )
+
 # ==================================================================================================
 # Token Settings
 # ==================================================================================================

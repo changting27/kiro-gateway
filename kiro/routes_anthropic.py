@@ -62,7 +62,7 @@ from kiro.utils import generate_conversation_id
 from kiro.tokenizer import estimate_request_tokens
 from kiro.config import WEB_SEARCH_ENABLED
 from kiro.mcp_tools import handle_native_web_search
-from kiro.kiro_errors import enhance_kiro_error, build_anthropic_error_body
+from kiro.kiro_errors import build_anthropic_error_body, parse_upstream_error
 
 # Import debug_logger
 try:
@@ -593,14 +593,13 @@ async def messages(
                     await http_client.close()
                     error_text = error_content.decode('utf-8', errors='replace')
                     
-                    # Extract error reason and save for final return.
-                    # Run non-JSON bodies through the enhancer too, so the
-                    # text-based context-overflow fallback can still fire.
-                    try:
-                        error_json = json.loads(error_text)
-                        error_info = enhance_kiro_error(error_json)
-                    except (json.JSONDecodeError, KeyError):
-                        error_info = enhance_kiro_error({"message": error_text})
+                    # Extract error reason and save for final return. The shared
+                    # parser also runs non-JSON bodies through the enhancer (so the
+                    # text-based context-overflow fallback can still fire) and
+                    # recognizes responses produced by network intermediaries.
+                    error_info = parse_upstream_error(
+                        response.status_code, response.headers, error_text
+                    )
                     error_reason = error_info.reason
                     last_error_message = error_info.user_message
                     last_error_status = response.status_code
@@ -829,13 +828,11 @@ async def messages(
             await http_client.close()
             error_text = error_content.decode('utf-8', errors='replace')
             
-            # Parse Kiro's error; run non-JSON bodies through the enhancer too so
-            # the text-based context-overflow fallback can still fire.
-            try:
-                error_json = json.loads(error_text)
-                error_info = enhance_kiro_error(error_json)
-            except (json.JSONDecodeError, KeyError):
-                error_info = enhance_kiro_error({"message": error_text})
+            # Parse the upstream error through the shared parser (Kiro errors,
+            # text-based context-overflow fallback, and network intermediaries).
+            error_info = parse_upstream_error(
+                response.status_code, response.headers, error_text
+            )
             error_message = error_info.user_message
             logger.debug(f"Original Kiro error: {error_info.original_message} (reason: {error_info.reason})")
             

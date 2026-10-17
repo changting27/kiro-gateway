@@ -107,6 +107,7 @@ tests/
 │   ├── test_account_system_flow.py # Account System integration tests (full failover, sticky behavior, Circuit Breaker, state persistence)
 │   ├── test_full_flow.py           # End-to-end tests
 │   ├── test_generate_assistant_response_url_flow.py # Canonical POST / generation URL across all surfaces/modes/account paths
+│   ├── test_upstream_intermediary_error_flow.py # Non-AWS proxy errors → actionable 502 across all surfaces/modes/account paths
 │   └── test_invalid_model_retry_flow.py # INVALID_MODEL_ID retry consistency across all API surfaces/modes
 └── README.md                        # This file
 ```

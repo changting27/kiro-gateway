@@ -54,7 +54,7 @@ from kiro.config import PROFILE_ARN, get_kiro_generate_assistant_response_url
 from kiro.http_client import KiroHttpClient
 from kiro.streaming_core import collect_nonstreaming_with_retry
 from kiro.utils import generate_conversation_id
-from kiro.kiro_errors import enhance_kiro_error
+from kiro.kiro_errors import parse_upstream_error
 
 # Import debug_logger (optional — may be unavailable in minimal deployments)
 try:
@@ -413,7 +413,9 @@ async def _execute_with_account_system(
             error_text = await _read_error_text(response)
             await http_client.close()
 
-            error_info = _enhance_error(error_text)
+            error_info = parse_upstream_error(
+                response.status_code, response.headers, error_text
+            )
             error_reason = error_info.reason
             last_error_message = error_info.user_message
             last_error_status = response.status_code
@@ -540,7 +542,9 @@ async def _execute_legacy(
             error_text = await _read_error_text(response)
             await http_client.close()
 
-            error_info = _enhance_error(error_text)
+            error_info = parse_upstream_error(
+                response.status_code, response.headers, error_text
+            )
             error_message = error_info.user_message
             logger.debug(
                 f"Original Kiro error: {error_info.original_message} "
@@ -585,26 +589,6 @@ async def _execute_legacy(
         if debug_logger:
             debug_logger.flush_on_error(500, str(e))
         raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
-
-
-def _enhance_error(error_text: str) -> Any:
-    """
-    Parse and enhance a Kiro error body.
-
-    Runs non-JSON bodies through the enhancer too, so the text-based
-    context-overflow fallback can still fire.
-
-    Args:
-        error_text: Raw upstream error text.
-
-    Returns:
-        The enhanced error info object from ``enhance_kiro_error``.
-    """
-    try:
-        error_json = json.loads(error_text)
-        return enhance_kiro_error(error_json)
-    except (json.JSONDecodeError, KeyError):
-        return enhance_kiro_error({"message": error_text})
 
 
 def _log_kiro_payload(kiro_payload: Dict[str, Any]) -> None:

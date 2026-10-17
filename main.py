@@ -81,6 +81,7 @@ from kiro.config import (
     ACCOUNTS_CONFIG_FILE,
     ACCOUNTS_STATE_FILE,
     _warn_timeout_configuration,
+    describe_generate_assistant_response_path_override,
 )
 from kiro.auth import KiroAuthManager
 from kiro.cache import ModelInfoCache
@@ -338,6 +339,10 @@ async def lifespan(app: FastAPI):
     concurrent requests efficiently (fixes issue #24).
     """
     logger.info("Starting application... Creating state managers.")
+
+    path_override_message = describe_generate_assistant_response_path_override()
+    if path_override_message:
+        logger.info(path_override_message)
     
     # Create shared HTTP client with connection pooling
     # This reduces memory usage and enables connection reuse across requests

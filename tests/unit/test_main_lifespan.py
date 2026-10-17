@@ -905,3 +905,59 @@ class TestLifespanAccountManagerInit:
         print(f"Save calls: {len(save_calls)}")
         assert len(save_calls) >= 2
         print("✓ Final state save was performed on shutdown")
+
+
+# =============================================================================
+# Test Class: Generation path override startup log
+# =============================================================================
+
+class TestLifespanGenerationPathLog:
+    """
+    Tests for the startup INFO line describing a non-default generation path.
+
+    What it does: Runs the real lifespan through TestClient with the description
+    helper patched.
+    Purpose: An overridden KIRO_GENERATE_ASSISTANT_RESPONSE_PATH changes where
+    every generation request goes, so it must be visible in startup logs.
+    """
+
+    @staticmethod
+    def _startup_logs(clean_app, message):
+        """Run lifespan startup/shutdown and collect INFO+ log messages.
+
+        Args:
+            clean_app: FastAPI application fixture.
+            message: Value returned by the patched description helper.
+
+        Returns:
+            List of logged message strings.
+        """
+        from fastapi.testclient import TestClient
+        from loguru import logger
+
+        captured = []
+        sink_id = logger.add(lambda m: captured.append(m.record["message"]), level="INFO")
+        try:
+            with patch(
+                "main.describe_generate_assistant_response_path_override",
+                return_value=message,
+            ):
+                with TestClient(clean_app):
+                    pass
+        finally:
+            logger.remove(sink_id)
+        return captured
+
+    def test_override_is_logged_at_startup(self, clean_app):
+        """What it does: a non-default path produces exactly one INFO line."""
+        message = "Generation request path overridden: test"
+
+        logs = self._startup_logs(clean_app, message)
+
+        assert logs.count(message) == 1
+
+    def test_default_path_logs_nothing(self, clean_app):
+        """What it does: the default path adds no override line."""
+        logs = self._startup_logs(clean_app, None)
+
+        assert not any("Generation request path overridden" in m for m in logs)

@@ -312,3 +312,27 @@ class TestClassifyErrorComprehensive:
             result = classify_error(400, reason)
             print(f"400 + reason={reason}: {result}")
             assert result == ErrorType.FATAL, f"400 + {reason} should be FATAL"
+
+
+class TestClassifyErrorUpstreamIntermediary:
+    """Errors produced by a network intermediary are never account failures."""
+
+    @pytest.mark.parametrize("status_code", [400, 402, 403, 404, 429, 500, 503])
+    def test_intermediary_reason_is_fatal_for_any_status(self, status_code):
+        """What it does: UPSTREAM_INTERMEDIARY is FATAL regardless of status.
+
+        Purpose: Every account shares the same network path, so failover cannot
+        help, and RECOVERABLE would wrongly penalize a healthy account (402/403/
+        429 are otherwise RECOVERABLE).
+        """
+        from kiro.kiro_errors import UPSTREAM_INTERMEDIARY_REASON
+
+        assert classify_error(status_code, UPSTREAM_INTERMEDIARY_REASON) == ErrorType.FATAL
+
+    @pytest.mark.parametrize("status_code", [402, 403, 429])
+    def test_kiro_recoverable_statuses_unchanged(self, status_code):
+        """What it does: regular Kiro 402/403/429 stay RECOVERABLE.
+
+        Purpose: The intermediary rule must not change Kiro failover behavior.
+        """
+        assert classify_error(status_code, None) == ErrorType.RECOVERABLE
