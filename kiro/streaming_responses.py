@@ -85,6 +85,7 @@ from kiro.streaming_core import (
     collect_stream_to_result,
     FirstTokenTimeoutError,
     calculate_tokens_from_context_usage,
+    format_refusal_message,
     stream_with_first_token_retry as stream_with_first_token_retry_core,
 )
 
@@ -173,6 +174,7 @@ def _build_response_object(
     output: List[Dict[str, Any]],
     usage: Optional[Dict[str, Any]],
     output_text: Optional[str] = None,
+    incomplete_details: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Assemble a Responses ``response`` object.
@@ -182,10 +184,12 @@ def _build_response_object(
         response_id: The stable ``resp_...`` id shared by created/completed events.
         model: The client-facing model name.
         created_at: Unix creation timestamp.
-        status: ``in_progress`` or ``completed``.
+        status: ``in_progress``, ``completed`` or ``incomplete``.
         output: The list of output items (empty until content is produced).
         usage: Usage object, or None while the response is in progress.
         output_text: Convenience aggregation of message text (completed only).
+        incomplete_details: Reason object when ``status="incomplete"`` (e.g.
+            ``{"reason": "content_filter"}``), else None.
 
     Returns:
         A response object dict suitable for created/in_progress/completed events
@@ -200,7 +204,7 @@ def _build_response_object(
         "output": output,
         "usage": usage,
         "error": None,
-        "incomplete_details": None,
+        "incomplete_details": incomplete_details,
     }
     # Echo request-derived fields (instructions, tools, tool_choice, temperature,
     # top_p, max_output_tokens, parallel_tool_calls, reasoning, metadata,
@@ -362,6 +366,8 @@ async def stream_kiro_to_responses_internal(
     full_thinking = ""
     tool_calls_from_stream: List[Dict[str, Any]] = []
     context_usage_percentage: Optional[float] = None
+    # Content-filter refusal metadata (set if upstream blocks the conversation).
+    refusal_info: Optional[Dict[str, Any]] = None
 
     # Reasoning item state.
     reasoning_open = False
@@ -495,6 +501,67 @@ async def stream_kiro_to_responses_internal(
             elif event.type == "context_usage" and event.context_usage_percentage is not None:
                 context_usage_percentage = event.context_usage_percentage
 
+            elif event.type == "refusal" and event.refusal is not None:
+                # Surface the upstream content-filter refusal as visible message
+                # text; the response is finalised with status="incomplete" and
+                # incomplete_details.reason="content_filter" below.
+                refusal_info = event.refusal
+                refusal_text = format_refusal_message(refusal_info)
+
+                # Close an open reasoning item before the message item begins.
+                if reasoning_open:
+                    yield _sse(
+                        "response.reasoning_summary_text.done", seq,
+                        item_id=reasoning_id, output_index=reasoning_index,
+                        summary_index=0, text=reasoning_text,
+                    )
+                    yield _sse(
+                        "response.reasoning_summary_part.done", seq,
+                        item_id=reasoning_id, output_index=reasoning_index,
+                        summary_index=0,
+                        part={"type": "summary_text", "text": reasoning_text},
+                    )
+                    yield _sse(
+                        "response.output_item.done", seq,
+                        output_index=reasoning_index,
+                        item={
+                            "id": reasoning_id, "type": "reasoning",
+                            "summary": [{"type": "summary_text", "text": reasoning_text}],
+                        },
+                    )
+                    output_items.append({
+                        "id": reasoning_id, "type": "reasoning",
+                        "summary": [{"type": "summary_text", "text": reasoning_text}],
+                    })
+                    reasoning_open = False
+
+                if not message_open:
+                    message_open = True
+                    message_id = _new_id("msg")
+                    message_index = next_index
+                    next_index += 1
+                    yield _sse(
+                        "response.output_item.added", seq,
+                        output_index=message_index,
+                        item={
+                            "id": message_id, "type": "message", "role": "assistant",
+                            "status": "in_progress", "content": [],
+                        },
+                    )
+                    yield _sse(
+                        "response.content_part.added", seq,
+                        item_id=message_id, output_index=message_index, content_index=0,
+                        part={"type": "output_text", "text": "", "annotations": []},
+                    )
+
+                message_text += refusal_text
+                full_content += refusal_text
+                yield _sse(
+                    "response.output_text.delta", seq,
+                    item_id=message_id, output_index=message_index,
+                    content_index=0, delta=refusal_text, logprobs=[],
+                )
+
             # 'usage' events carry only Kiro credit metering; token usage is
             # computed from context_usage_percentage / tiktoken below.
 
@@ -606,10 +673,13 @@ async def stream_kiro_to_responses_internal(
             response_id=response_id,
             model=model,
             created_at=created_at,
-            status="completed",
+            status="incomplete" if refusal_info is not None else "completed",
             output=output_items,
             usage=usage,
             output_text=message_text,
+            incomplete_details=(
+                {"reason": "content_filter"} if refusal_info is not None else None
+            ),
         )
         yield _sse("response.completed", seq, response=completed)
         yield "data: [DONE]\n\n"
@@ -796,14 +866,19 @@ async def collect_responses_response(
         })
         next_index += 1
 
-    # Message item (if any assistant text).
-    if result.content:
+    # Message item (if any assistant text). When the upstream content filter fired,
+    # surface its explanation as the message text so the client sees WHY generation
+    # stopped instead of an empty, silently-"completed" response.
+    message_text = result.content
+    if result.refusal is not None:
+        message_text += format_refusal_message(result.refusal)
+    if message_text:
         output_items.append({
             "id": _new_id("msg"),
             "type": "message",
             "role": "assistant",
             "status": "completed",
-            "content": [{"type": "output_text", "text": result.content, "annotations": []}],
+            "content": [{"type": "output_text", "text": message_text, "annotations": []}],
         })
         next_index += 1
 
@@ -823,7 +898,7 @@ async def collect_responses_response(
         next_index += 1
 
     usage = _compute_usage(
-        full_content=result.content,
+        full_content=message_text,
         full_thinking=result.thinking_content,
         tool_calls=normalized_tool_calls,
         context_usage_percentage=result.context_usage_percentage,
@@ -838,8 +913,11 @@ async def collect_responses_response(
         response_id=response_id,
         model=model,
         created_at=created_at,
-        status="completed",
+        status="incomplete" if result.refusal is not None else "completed",
         output=output_items,
         usage=usage,
-        output_text=result.content,
+        output_text=message_text,
+        incomplete_details=(
+            {"reason": "content_filter"} if result.refusal is not None else None
+        ),
     )

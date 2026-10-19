@@ -28,6 +28,8 @@ from kiro.streaming_core import (
     collect_stream_to_result,
     collect_nonstreaming_with_retry,
     calculate_tokens_from_context_usage,
+    format_refusal_message,
+    DEFAULT_REFUSAL_MESSAGE,
     stream_with_first_token_retry,
     _process_chunk,
 )
@@ -2199,3 +2201,76 @@ class TestCollectNonstreamingWithRetry:
             await collect_nonstreaming_with_retry(_FakeResponse(200), make_request, collect, max_attempts=3)
 
         assert make_calls["n"] == 0
+
+
+# ==================================================================================================
+# Tests for content-filter refusal propagation
+# ==================================================================================================
+
+class TestRefusalPropagation:
+    """Refusal events flow through _process_chunk and collect_stream_to_result."""
+
+    @pytest.mark.asyncio
+    async def test_process_chunk_yields_refusal_event(self, mock_parser):
+        """
+        What it does: Parser returns a refusal event; _process_chunk forwards it.
+        Goal: KiroEvent(type='refusal') carries the refusal metadata through.
+        """
+        mock_parser.feed.return_value = [
+            {"type": "refusal", "data": {"category": "CYBER", "explanation": "blocked"}}
+        ]
+
+        events = [e async for e in _process_chunk(mock_parser, b"chunk", None)]
+
+        refusals = [e for e in events if e.type == "refusal"]
+        assert len(refusals) == 1
+        assert refusals[0].refusal == {"category": "CYBER", "explanation": "blocked"}
+
+    @pytest.mark.asyncio
+    async def test_collect_stream_captures_refusal(self, mock_response, mock_parser):
+        """
+        What it does: A stream carrying a refusal event is collected.
+        Goal: StreamResult.refusal is populated and content stays empty.
+        """
+        mock_parser.feed.return_value = [
+            {"type": "refusal", "data": {"category": "CYBER", "explanation": "nope"}},
+            {"type": "context_usage", "data": 23.2},
+        ]
+
+        async def mock_aiter_bytes():
+            yield b"chunk1"
+
+        mock_response.aiter_bytes = mock_aiter_bytes
+
+        with patch("kiro.streaming_core.AwsEventStreamParser", return_value=mock_parser):
+            with patch("kiro.streaming_core.FAKE_REASONING_ENABLED", False):
+                result = await collect_stream_to_result(mock_response, first_token_timeout=30)
+
+        assert result.refusal == {"category": "CYBER", "explanation": "nope"}
+        assert result.content == ""
+        assert result.context_usage_percentage == 23.2
+
+
+class TestFormatRefusalMessage:
+    """format_refusal_message is the single source of refusal text for all surfaces."""
+
+    def test_uses_upstream_explanation_when_present(self):
+        """Goal: Kiro's own explanation is surfaced verbatim (trimmed)."""
+        msg = format_refusal_message({"category": "CYBER", "explanation": "  blocked X  "})
+        assert msg == "blocked X"
+
+    def test_falls_back_when_explanation_missing(self):
+        """Goal: A non-empty, generic message is returned when no explanation."""
+        assert format_refusal_message({"category": "CYBER"}) == DEFAULT_REFUSAL_MESSAGE
+
+    def test_falls_back_on_blank_explanation(self):
+        """Goal: Whitespace-only explanation falls back to the default."""
+        assert format_refusal_message({"explanation": "   "}) == DEFAULT_REFUSAL_MESSAGE
+
+    def test_falls_back_on_none(self):
+        """Goal: None refusal yields the default message (never empty)."""
+        assert format_refusal_message(None) == DEFAULT_REFUSAL_MESSAGE
+
+    def test_falls_back_on_non_string_explanation(self):
+        """Goal: Non-string explanation is rejected and the default is used."""
+        assert format_refusal_message({"explanation": 123}) == DEFAULT_REFUSAL_MESSAGE

@@ -53,6 +53,7 @@ from kiro.streaming_core import (
     FirstTokenTimeoutError,
     KiroEvent,
     calculate_tokens_from_context_usage,
+    format_refusal_message,
     stream_with_first_token_retry as stream_with_first_token_retry_core,
 )
 
@@ -124,6 +125,7 @@ async def stream_kiro_to_openai_internal(
     context_usage_percentage = None
     full_content = ""
     full_thinking_content = ""  # Accumulated thinking content for non-streaming
+    refusal_info = None  # Content-filter refusal metadata (set if upstream blocks)
     
     streaming_error_occurred = False
     tool_calls_from_stream = []
@@ -275,6 +277,31 @@ async def stream_kiro_to_openai_internal(
             
             elif event.type == "context_usage" and event.context_usage_percentage is not None:
                 context_usage_percentage = event.context_usage_percentage
+
+            elif event.type == "refusal" and event.refusal is not None:
+                refusal_info = event.refusal
+
+        # Surface an upstream content-filter refusal as a visible content delta so the
+        # client shows WHY generation stopped instead of receiving a silent empty
+        # response. The finish_reason is set to "content_filter" below.
+        if refusal_info is not None:
+            refusal_text = format_refusal_message(refusal_info)
+            full_content += refusal_text
+            delta = {"content": refusal_text}
+            if first_chunk:
+                delta["role"] = "assistant"
+                first_chunk = False
+            refusal_chunk = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created_time,
+                "model": model,
+                "choices": [{"index": 0, "delta": delta, "finish_reason": None}]
+            }
+            chunk_text = f"data: {json.dumps(refusal_chunk, ensure_ascii=False)}\n\n"
+            if debug_logger:
+                debug_logger.log_modified_chunk(chunk_text.encode('utf-8'))
+            yield chunk_text
         
         # Track completion signals for truncation detection
         received_usage = metering_data is not None
@@ -301,8 +328,10 @@ async def stream_kiro_to_openai_internal(
                 f"{'Model will be notified automatically about truncation.' if TRUNCATION_RECOVERY else 'Set TRUNCATION_RECOVERY=true in .env to auto-notify model about truncation.'}"
             )
         
-        # Determine finish_reason (truncation has highest priority)
-        if content_was_truncated:
+        # Determine finish_reason (refusal first, then truncation, then tools)
+        if refusal_info is not None:
+            finish_reason = "content_filter"
+        elif content_was_truncated:
             finish_reason = "length"
         elif all_tool_calls:
             finish_reason = "tool_calls"

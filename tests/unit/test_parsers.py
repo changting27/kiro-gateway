@@ -1467,3 +1467,111 @@ class TestAwsEventStreamParserTruncationDebugFlush:
         assert len(aws_event_parser.tool_calls) == 1
         assert aws_event_parser.tool_calls[0]["function"]["arguments"] == "{}"
         assert aws_event_parser.tool_calls[0].get("_truncation_detected") is True
+
+
+class TestContentFilteredRefusal:
+    """Tests for CONTENT_FILTERED metadata-event refusal detection.
+
+    The detection rule is deliberately conservative and exact-match: only a
+    metadata event whose top-level ``stopReason`` is exactly ``CONTENT_FILTERED``
+    produces a refusal event. Everything else is ignored so ordinary completions
+    are never misclassified.
+    """
+
+    def test_full_refusal_metadata_emits_refusal_event(self, aws_event_parser):
+        """
+        What it does: Feeds the real Kiro content-filter metadata frame.
+        Goal: A structured refusal event with category + explanation is emitted.
+        """
+        chunk = (
+            b'{"stopDetails":{"refusal":{"category":"CYBER",'
+            b'"explanation":"The selected model cannot continue this conversation."}},'
+            b'"stopReason":"CONTENT_FILTERED"}'
+        )
+
+        events = aws_event_parser.feed(chunk)
+
+        refusals = [e for e in events if e["type"] == "refusal"]
+        assert len(refusals) == 1
+        assert refusals[0]["data"]["category"] == "CYBER"
+        assert refusals[0]["data"]["explanation"] == (
+            "The selected model cannot continue this conversation."
+        )
+
+    def test_refusal_without_explanation_emits_none_fields(self, aws_event_parser):
+        """
+        What it does: Content filter fires but refusal object lacks fields.
+        Goal: Event is still emitted with None category/explanation (no crash).
+        """
+        chunk = b'{"stopDetails":{"refusal":{}},"stopReason":"CONTENT_FILTERED"}'
+
+        events = aws_event_parser.feed(chunk)
+
+        refusals = [e for e in events if e["type"] == "refusal"]
+        assert len(refusals) == 1
+        assert refusals[0]["data"]["category"] is None
+        assert refusals[0]["data"]["explanation"] is None
+
+    def test_bare_stop_reason_content_filtered_emits_refusal(self, aws_event_parser):
+        """
+        What it does: Metadata frame carries only stopReason, no stopDetails.
+        Goal: The fallback pattern still produces a refusal event.
+        """
+        chunk = b'{"stopReason":"CONTENT_FILTERED"}'
+
+        events = aws_event_parser.feed(chunk)
+
+        refusals = [e for e in events if e["type"] == "refusal"]
+        assert len(refusals) == 1
+        assert refusals[0]["data"]["explanation"] is None
+
+    def test_non_filtered_stop_reason_is_ignored(self, aws_event_parser):
+        """
+        What it does: A normal end-of-turn metadata frame.
+        Goal: No refusal event — the rule must not fire on ordinary completions.
+        """
+        chunk = b'{"stopDetails":{},"stopReason":"END_TURN"}'
+
+        events = aws_event_parser.feed(chunk)
+
+        assert [e for e in events if e["type"] == "refusal"] == []
+
+    def test_non_string_stop_reason_is_ignored(self, aws_event_parser):
+        """
+        What it does: stopReason is a non-string (adversarial/malformed).
+        Goal: No refusal event; exact-string match guards against this.
+        """
+        chunk = b'{"stopReason":{"nested":"CONTENT_FILTERED"}}'
+
+        events = aws_event_parser.feed(chunk)
+
+        assert [e for e in events if e["type"] == "refusal"] == []
+
+    def test_content_filtered_substring_in_text_is_not_matched(self, aws_event_parser):
+        """
+        What it does: A content event mentioning CONTENT_FILTERED as plain text.
+        Goal: Only metadata stopReason triggers refusal, never message text.
+        """
+        chunk = b'{"content":"the server returned stopReason CONTENT_FILTERED once"}'
+
+        events = aws_event_parser.feed(chunk)
+
+        assert [e for e in events if e["type"] == "refusal"] == []
+        assert [e for e in events if e["type"] == "content"]
+
+    def test_refusal_followed_by_context_usage_both_parsed(self, aws_event_parser):
+        """
+        What it does: Real stream order — refusal metadata then contextUsageEvent.
+        Goal: Both events are parsed from a single combined chunk.
+        """
+        chunk = (
+            b'{"stopDetails":{"refusal":{"category":"CYBER","explanation":"blocked"}},'
+            b'"stopReason":"CONTENT_FILTERED"}'
+            b'{"contextUsagePercentage":23.23}'
+        )
+
+        events = aws_event_parser.feed(chunk)
+
+        types = [e["type"] for e in events]
+        assert "refusal" in types
+        assert "context_usage" in types

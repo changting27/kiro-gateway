@@ -36,6 +36,13 @@ from loguru import logger
 from kiro.utils import generate_tool_call_id
 
 
+# Exact Kiro stop-reason sentinel emitted when the upstream content filter blocks a
+# conversation. The gateway surfaces this to the client instead of silently ending the
+# stream with no output. Matching is exact and conservative (mirrors the INVALID_MODEL_ID
+# and UPSTREAM_INTERMEDIARY rules): only this literal reason triggers a refusal event.
+CONTENT_FILTERED_STOP_REASON: str = "CONTENT_FILTERED"
+
+
 def find_matching_brace(text: str, start_pos: int) -> int:
     """
     Finds the position of the closing brace considering nesting and strings.
@@ -246,6 +253,12 @@ class AwsEventStreamParser:
         ('{"followupPrompt":', 'followup'),
         ('{"usage":', 'usage'),
         ('{"contextUsagePercentage":', 'context_usage'),
+        # Kiro metadataEvent carrying a terminal stop decision. The content-filter
+        # refusal object always begins with "stopDetails"; a bare "stopReason"
+        # object is matched as a fallback. Both route to the same handler, which
+        # only emits an event for the exact CONTENT_FILTERED sentinel.
+        ('{"stopDetails":', 'stop_metadata'),
+        ('{"stopReason":', 'stop_metadata'),
     ]
     
     def __init__(self):
@@ -328,9 +341,53 @@ class AwsEventStreamParser:
             return {"type": "usage", "data": data.get('usage', 0)}
         elif event_type == 'context_usage':
             return {"type": "context_usage", "data": data.get('contextUsagePercentage', 0)}
+        elif event_type == 'stop_metadata':
+            return self._process_stop_metadata_event(data)
         
         return None
     
+    def _process_stop_metadata_event(self, data: dict) -> Optional[Dict[str, Any]]:
+        """
+        Processes a Kiro metadataEvent carrying a terminal stop decision.
+
+        Only the exact ``stopReason == "CONTENT_FILTERED"`` sentinel produces an
+        event; every other stop reason (e.g. a normal end-of-turn metadata frame)
+        is ignored so this stays a conservative, exact-match rule and never
+        misclassifies ordinary completions as refusals.
+
+        Args:
+            data: Parsed metadata JSON, e.g.
+                ``{"stopDetails": {"refusal": {"category": "CYBER",
+                "explanation": "..."}}, "stopReason": "CONTENT_FILTERED"}``.
+
+        Returns:
+            A ``{"type": "refusal", "data": {...}}`` event when the content filter
+            fired, otherwise ``None``.
+        """
+        if data.get('stopReason') != CONTENT_FILTERED_STOP_REASON:
+            return None
+
+        stop_details = data.get('stopDetails')
+        refusal = stop_details.get('refusal') if isinstance(stop_details, dict) else None
+        if not isinstance(refusal, dict):
+            refusal = {}
+
+        category = refusal.get('category')
+        explanation = refusal.get('explanation')
+
+        logger.warning(
+            "Kiro content filter blocked the conversation "
+            f"(category={category!r}); surfacing refusal to client."
+        )
+
+        return {
+            "type": "refusal",
+            "data": {
+                "category": category if isinstance(category, str) else None,
+                "explanation": explanation if isinstance(explanation, str) else None,
+            },
+        }
+
     def _process_content_event(self, data: dict) -> Optional[Dict[str, Any]]:
         """Processes content event."""
         content = data.get('content', '')

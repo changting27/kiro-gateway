@@ -108,7 +108,8 @@ tests/
 │   ├── test_full_flow.py           # End-to-end tests
 │   ├── test_generate_assistant_response_url_flow.py # Canonical POST / generation URL across all surfaces/modes/account paths
 │   ├── test_upstream_intermediary_error_flow.py # Non-AWS proxy errors → actionable 502 across all surfaces/modes/account paths
-│   └── test_invalid_model_retry_flow.py # INVALID_MODEL_ID retry consistency across all API surfaces/modes
+│   ├── test_invalid_model_retry_flow.py # INVALID_MODEL_ID retry consistency across all API surfaces/modes
+│   └── test_content_filter_refusal_flow.py # CONTENT_FILTERED refusal surfaced (not silent empty 200) across all surfaces/modes
 └── README.md                        # This file
 ```
 

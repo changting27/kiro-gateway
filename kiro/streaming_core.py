@@ -71,12 +71,14 @@ class KiroEvent:
     This format is API-agnostic and can be converted to both OpenAI and Anthropic formats.
     
     Attributes:
-        type: Event type (content, thinking, tool_use, usage, context_usage, error)
+        type: Event type (content, thinking, tool_use, usage, context_usage, refusal, error)
         content: Text content (for content events)
         thinking_content: Thinking/reasoning content (for thinking events)
         tool_use: Tool use data (for tool_use events)
         usage: Usage/metering data (for usage events)
         context_usage_percentage: Context usage percentage (for context_usage events)
+        refusal: Content-filter refusal metadata (for refusal events), e.g.
+            ``{"category": "CYBER", "explanation": "..."}``
         is_first_thinking_chunk: Whether this is the first thinking chunk
         is_last_thinking_chunk: Whether this is the last thinking chunk
     """
@@ -86,6 +88,7 @@ class KiroEvent:
     tool_use: Optional[Dict[str, Any]] = None
     usage: Optional[Dict[str, Any]] = None
     context_usage_percentage: Optional[float] = None
+    refusal: Optional[Dict[str, Any]] = None
     is_first_thinking_chunk: bool = False
     is_last_thinking_chunk: bool = False
 
@@ -101,12 +104,15 @@ class StreamResult:
         tool_calls: List of tool calls
         usage: Usage information
         context_usage_percentage: Context usage percentage from Kiro API
+        refusal: Content-filter refusal metadata when the upstream blocked the
+            conversation (``{"category": ..., "explanation": ...}``), else None.
     """
     content: str = ""
     thinking_content: str = ""
     tool_calls: List[Dict[str, Any]] = field(default_factory=list)
     usage: Optional[Dict[str, Any]] = None
     context_usage_percentage: Optional[float] = None
+    refusal: Optional[Dict[str, Any]] = None
 
 
 class FirstTokenTimeoutError(Exception):
@@ -414,6 +420,9 @@ async def _process_chunk(
         elif event["type"] == "context_usage":
             yield KiroEvent(type="context_usage", context_usage_percentage=event["data"])
 
+        elif event["type"] == "refusal":
+            yield KiroEvent(type="refusal", refusal=event["data"])
+
 
 # ==================================================================================================
 # Full Response Collection
@@ -454,6 +463,8 @@ async def collect_stream_to_result(
             result.usage = event.usage
         elif event.type == "context_usage" and event.context_usage_percentage is not None:
             result.context_usage_percentage = event.context_usage_percentage
+        elif event.type == "refusal" and event.refusal is not None:
+            result.refusal = event.refusal
     
     # Check for bracket-style tool calls in full content
     bracket_tool_calls = parse_bracket_tool_calls(full_content_for_bracket_tools)
@@ -461,6 +472,43 @@ async def collect_stream_to_result(
         result.tool_calls = deduplicate_tool_calls(result.tool_calls + bracket_tool_calls)
     
     return result
+
+
+# ==================================================================================================
+# Content-Filter Refusal Formatting
+# ==================================================================================================
+
+# Fallback text shown to the client when Kiro blocks a conversation but provides no
+# human-readable explanation of its own. Kept generic and actionable without leaking
+# gateway internals.
+DEFAULT_REFUSAL_MESSAGE: str = (
+    "The upstream model declined to continue this conversation due to its content "
+    "policy. Try starting a new conversation or rephrasing the request."
+)
+
+
+def format_refusal_message(refusal: Optional[Dict[str, Any]]) -> str:
+    """
+    Build the client-facing text for an upstream content-filter refusal.
+
+    The gateway surfaces Kiro's own refusal verbatim when available so the user sees
+    exactly why generation stopped, instead of a silent empty response. A generic
+    fallback is used when the upstream omits an explanation. This is the single source
+    of truth for refusal text across all API surfaces (OpenAI Chat, OpenAI Responses,
+    Anthropic Messages).
+
+    Args:
+        refusal: Refusal metadata captured from the Kiro stream, typically
+            ``{"category": "CYBER", "explanation": "..."}``. May be ``None`` or empty.
+
+    Returns:
+        A non-empty, human-readable message describing the refusal.
+    """
+    if isinstance(refusal, dict):
+        explanation = refusal.get("explanation")
+        if isinstance(explanation, str) and explanation.strip():
+            return explanation.strip()
+    return DEFAULT_REFUSAL_MESSAGE
 
 
 # ==================================================================================================
