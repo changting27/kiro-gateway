@@ -618,6 +618,25 @@ class TestFallbackModelsConfig:
         has_claude = any("claude" in mid.lower() for mid in model_ids)
         assert has_claude, "No Claude models in fallback list"
     
+    def test_fallback_models_include_opus_and_sonnet_5_5(self):
+        """
+        What it does: Verifies the 1M-context 5.5 models are in the offline snapshot.
+        Purpose: claude-opus-5.5 and claude-sonnet-5.5 are declared by kiro-cli; the
+            static FALLBACK_MODELS snapshot must list them so they resolve as valid
+            runtime IDs even when the live /ListAvailableModels fetch is unreachable
+            (not relying solely on unknown-model pass-through).
+        """
+        from kiro.config import FALLBACK_MODELS
+        from kiro.model_resolver import VALID_RUNTIME_MODEL_IDS
+
+        model_ids = [m["modelId"] for m in FALLBACK_MODELS]
+        for expected in ("claude-opus-5.5", "claude-sonnet-5.5"):
+            assert expected in model_ids, f"{expected} missing from FALLBACK_MODELS"
+            # VALID_RUNTIME_MODEL_IDS is derived from FALLBACK_MODELS (single source).
+            assert expected in VALID_RUNTIME_MODEL_IDS, (
+                f"{expected} missing from VALID_RUNTIME_MODEL_IDS"
+            )
+
     def test_fallback_models_use_dot_format(self):
         """
         What it does: Verifies that model IDs use dot format (e.g., claude-4.5).

@@ -441,6 +441,8 @@ HIDDEN_FROM_LIST: List[str] = ["auto"]
 # - Update the gateway regularly to keep this snapshot current
 FALLBACK_MODELS: List[Dict[str, str]] = [
     {"modelId": "auto"},
+    {"modelId": "claude-opus-5.5"},
+    {"modelId": "claude-sonnet-5.5"},
     {"modelId": "claude-opus-5"},
     {"modelId": "claude-sonnet-5"},
     {"modelId": "claude-opus-4.8"},
